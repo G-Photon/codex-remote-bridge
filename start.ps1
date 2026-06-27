@@ -379,7 +379,7 @@ function Write-EnvFile {
         "QQ_REPLY_MAX_CHARS=$(Get-EnvValue -Map $Existing -Key 'QQ_REPLY_MAX_CHARS' -DefaultValue '1500')",
         "QQ_MAX_REPLY_CHUNKS=$(Get-EnvValue -Map $Existing -Key 'QQ_MAX_REPLY_CHUNKS' -DefaultValue '5')",
         "QQ_JOB_QUEUE_SIZE=$(Get-EnvValue -Map $Existing -Key 'QQ_JOB_QUEUE_SIZE' -DefaultValue '20')",
-        "QQ_CODEX_MAX_PARALLEL=$(Get-EnvValue -Map $Existing -Key 'QQ_CODEX_MAX_PARALLEL' -DefaultValue '2')",
+        "QQ_CODEX_MAX_PARALLEL=$(Get-EnvValue -Map $Existing -Key 'QQ_CODEX_MAX_PARALLEL' -DefaultValue '5')",
         "QQ_TASK_STATUS_INTERVAL_SECONDS=$(Get-EnvValue -Map $Existing -Key 'QQ_TASK_STATUS_INTERVAL_SECONDS' -DefaultValue '60')",
         "QQ_TASK_PARTIAL_INTERVAL_SECONDS=$(Get-EnvValue -Map $Existing -Key 'QQ_TASK_PARTIAL_INTERVAL_SECONDS' -DefaultValue '60')",
         "QQ_TASK_PARTIAL_MAX_CHARS=$(Get-EnvValue -Map $Existing -Key 'QQ_TASK_PARTIAL_MAX_CHARS' -DefaultValue '1200')",
