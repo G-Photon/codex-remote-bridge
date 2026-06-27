@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$Reconfigure,
     [switch]$Background,
     [switch]$CheckOnly,
