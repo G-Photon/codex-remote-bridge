@@ -28,6 +28,34 @@ CODEX_SESSION_INDEX = CODEX_HOME / "session_index.jsonl"
 CODEX_ARCHIVED_SESSIONS_DIR = CODEX_HOME / "archived_sessions"
 CODEX_STATE_DB = CODEX_HOME / "state_5.sqlite"
 
+_state_file_lock = threading.RLock()
+_pending_file_lock = threading.RLock()
+
+
+def write_json_atomic(path: Path, data: Dict[str, Any], lock: threading.RLock) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    tmp = path.with_name(
+        f"{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+    )
+    with lock:
+        try:
+            tmp.write_text(payload, encoding="utf-8")
+            for attempt in range(8):
+                try:
+                    tmp.replace(path)
+                    return
+                except PermissionError:
+                    if attempt == 7:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+
 
 def load_dotenv(path: Path) -> None:
     if not path.exists():
@@ -236,12 +264,20 @@ def load_state() -> Dict[str, Any]:
     if not isinstance(state, dict):
         state = {}
 
-    state.setdefault("context_mode", normalize_context_mode(CODEX_CONTEXT_MODE))
-    state.setdefault("active_native_session_id", "")
-    state.setdefault("model", CODEX_MODEL)
-    state.setdefault("reasoning_effort", normalize_reasoning(CODEX_REASONING_EFFORT))
-    state.setdefault("permission", normalize_permission(CODEX_PERMISSION))
-    state.setdefault("contacts", {})
+    changed = False
+
+    defaults = {
+        "context_mode": normalize_context_mode(CODEX_CONTEXT_MODE),
+        "active_native_session_id": "",
+        "model": CODEX_MODEL,
+        "reasoning_effort": normalize_reasoning(CODEX_REASONING_EFFORT),
+        "permission": normalize_permission(CODEX_PERMISSION),
+        "contacts": {},
+    }
+    for key, value in defaults.items():
+        if key not in state:
+            state[key] = value
+            changed = True
 
     sessions = state.get("sessions")
     if not isinstance(sessions, dict) or not sessions:
@@ -264,19 +300,20 @@ def load_state() -> Dict[str, Any]:
                 "message_count": message_count,
             }
         }
+        changed = True
     elif state.get("active_session_id") not in sessions:
         state["active_session_id"] = next(iter(sessions))
+        changed = True
 
-    save_state(state)
+    if changed:
+        save_state(state)
     return state
 
 
 def save_state(state: Dict[str, Any]) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(STATE_FILE)
+    write_json_atomic(STATE_FILE, state, _state_file_lock)
 
 
 def load_pending_approvals() -> Dict[str, Any]:
@@ -297,9 +334,7 @@ def load_pending_approvals() -> Dict[str, Any]:
 
 def save_pending_approvals(data: Dict[str, Any]) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = PENDING_APPROVALS_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(PENDING_APPROVALS_FILE)
+    write_json_atomic(PENDING_APPROVALS_FILE, data, _pending_file_lock)
 
 
 def approval_id() -> str:
@@ -364,12 +399,15 @@ def command_head(text: str) -> str:
 
 def is_bridge_command_text(text: str) -> bool:
     return command_head(text) in {
+        "/start",
         "/help",
         "/status",
         "/whoami",
         "/model",
         "/permission",
         "/resume",
+        "/recent",
+        "/last",
         "/new",
         "/delete",
         "/cancel",
@@ -818,7 +856,7 @@ def _extract_input_text(value: Any) -> str:
                 pieces.append(item.strip())
             continue
         item_type = str(item.get("type", ""))
-        if item_type in {"input_text", "text"}:
+        if item_type in {"input_text", "output_text", "text"}:
             text = item.get("text")
             if isinstance(text, str) and text.strip():
                 pieces.append(text.strip())
@@ -853,6 +891,52 @@ def _extract_native_user_text(line: str) -> str:
         return ""
 
     return ""
+
+
+def _extract_native_conversation_message(line: str) -> Optional[Dict[str, str]]:
+    if "message" not in line and "agent_message" not in line and '"role"' not in line:
+        return None
+    try:
+        event = json.loads(line)
+    except Exception:
+        return None
+
+    event_type = str(event.get("type") or "")
+    if event_type == "response_item":
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("type") == "message":
+            role = str(payload.get("role") or "").strip().lower()
+            if role not in {"user", "assistant"}:
+                return None
+            text = _extract_input_text(payload.get("content"))
+            if text:
+                return {"role": role, "text": text}
+        return None
+
+    if event_type in {"item.completed", "item.started"}:
+        item = event.get("item")
+        if not isinstance(item, dict):
+            return None
+        item_type = str(item.get("type") or "")
+        if item_type == "agent_message":
+            text = str(item.get("text") or "").strip()
+            if text:
+                return {"role": "assistant", "text": text}
+        return None
+
+    if event_type == "event_msg":
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("type") == "user_message":
+            message = payload.get("message")
+            if isinstance(message, str) and message.strip():
+                return {"role": "user", "text": message.strip()}
+        return None
+
+    return None
 
 
 def _clean_native_title(text: str) -> str:
@@ -1255,6 +1339,93 @@ def find_native_session(session_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def native_session_messages(session_id: str, limit: int = 20) -> List[Dict[str, str]]:
+    item = find_native_session(session_id)
+    if not item:
+        return []
+    path = Path(str(item.get("path") or ""))
+    if not path.exists():
+        return []
+
+    messages: List[Dict[str, str]] = []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return []
+    for line in lines:
+        message = _extract_native_conversation_message(line.strip())
+        if message:
+            messages.append(message)
+    return messages[-limit:] if limit > 0 else messages
+
+
+def current_native_session_id() -> str:
+    state = load_state()
+    return str(state.get("active_native_session_id", "")).strip()
+
+
+def truncate_message_text(text: str, limit: int = 360) -> str:
+    text = (text or "").replace("\r\n", "\n").strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 12)].rstrip() + " ...[截断]"
+
+
+def format_native_messages(messages: List[Dict[str, str]], title: str = "") -> str:
+    if not messages:
+        return "没有找到可展示的最近对话内容。"
+    lines = [title] if title else []
+    for index, message in enumerate(messages, 1):
+        role = "我" if message.get("role") == "user" else "Codex"
+        text = truncate_message_text(message.get("text", ""))
+        lines.append(f"--- {index}. {role} ---")
+        lines.append(text)
+    return "\n".join(lines)
+
+
+def parse_recent_args(args: str) -> Dict[str, Any]:
+    raw = (args or "").strip()
+    result: Dict[str, Any] = {"count": 4, "session_id": ""}
+    for token in raw.split():
+        if re.fullmatch(r"\d+", token):
+            result["count"] = max(1, min(10, int(token)))
+        elif token.lower() in {"last", "latest"} or token in {"最近"}:
+            continue
+        else:
+            result["session_id"] = token
+    return result
+
+
+def recent_command(args: str = "") -> str:
+    parsed = parse_recent_args(args)
+    session_id = str(parsed.get("session_id") or "").strip()
+    if session_id:
+        session_id = resolve_native_session_id(session_id)
+    else:
+        session_id = current_native_session_id()
+    if not session_id:
+        return "当前没有 active Codex 原生会话。先发送 /resume 选择会话，或发送 /new 创建新会话。"
+    count = int(parsed.get("count") or 4)
+    messages = native_session_messages(session_id, limit=count)
+    return format_native_messages(messages, f"最近 {count} 条对话 | {session_id[-8:]}")
+
+
+def last_command(args: str = "") -> str:
+    mode = (args or "").strip().lower()
+    session_id = current_native_session_id()
+    if not session_id:
+        return "当前没有 active Codex 原生会话。先发送 /resume 选择会话。"
+    messages = native_session_messages(session_id, limit=80)
+    if mode in {"user", "me", "mine", "u", "我"}:
+        messages = [item for item in messages if item.get("role") == "user"]
+        return format_native_messages(messages[-1:], "我发出的上一句")
+    if mode in {"codex", "assistant", "answer", "a", "回复"}:
+        messages = [item for item in messages if item.get("role") == "assistant"]
+        return format_native_messages(messages[-1:], "Codex 的上一句回复")
+    return format_native_messages(messages[-2:], "最近一轮对话")
+
+
 def extract_thread_id(stdout: str) -> str:
     for line in stdout.splitlines():
         line = line.strip()
@@ -1532,6 +1703,7 @@ def status_text() -> str:
 def help_text() -> str:
     return "\n".join([
         "可用指令：",
+        "/start - 显示入口面板、当前模型和快捷按钮",
         "/help - 展示所有指令",
         "/status - 显示 Gateway、模型、思考强度、历史长度、权限",
         "/whoami - 显示当前 QQ Gateway openid，用于配置 allowlist",
@@ -1552,9 +1724,31 @@ def help_text() -> str:
         "/resume page 2 - 展示目录第 2 页",
         "/resume dir <目录> - 展示指定目录下的会话",
         "/resume <id> - 切换到指定 Codex 原生会话",
+        "/recent - 查看当前会话最近 4 条对话",
+        "/recent N - 查看当前会话最近 N 条对话（N=1-10）",
+        "/recent N <id> - 查看指定会话最近 N 条对话（N=1-10）",
+        "/last user - 查看我发出的上一句",
+        "/last codex - 查看 Codex 的上一句回复",
         "/new [标题] - 开启一段新的 Codex 原生会话",
         "/delete - 展示 Codex 原生会话列表",
         "/delete <id> - 归档指定 Codex 原生会话",
+    ])
+
+
+def start_text() -> str:
+    runtime = current_runtime()
+    return "\n".join([
+        "Codex Remote Bridge 已启动",
+        "我是你的远程 Codex 助手，可以通过 QQ 帮你查看和切换 Codex 会话、继续对话、调整模型、查看状态，并把需要审批的操作发回给你确认。",
+        f"model: {runtime['model']}",
+        f"reasoning: {runtime['reasoning_effort']}",
+        "",
+        "点击按钮或发送命令开始使用：",
+        "/resume - Codex 会话列表",
+        "/model - 模型设置",
+        "/whoami - 用户信息",
+        "/status - 状态",
+        "/help - 帮助",
     ])
 
 
@@ -1696,7 +1890,7 @@ def resume_command(args: str) -> str:
         state["active_native_session_id"] = session_id
         state["context_mode"] = "native"
         save_state(state)
-        return f"已切换到 Codex 原生会话：{session_id}"
+        return f"已切换到 Codex 原生会话：{session_id}\n发送 /recent 查看最近对话内容。"
 
     try:
         session_id = safe_local_session_id(session_id)
@@ -1779,6 +1973,8 @@ def handle_bridge_command(text: str, job: Optional[Dict[str, Any]] = None) -> Op
     command = command.lower().strip()
     args = args.strip()
 
+    if command == "/start":
+        return start_text()
     if command == "/help":
         return help_text()
     if command == "/status":
@@ -1799,6 +1995,10 @@ def handle_bridge_command(text: str, job: Optional[Dict[str, Any]] = None) -> Op
         return revise_command(args)
     if command == "/resume":
         return resume_command(args)
+    if command == "/recent":
+        return recent_command(args)
+    if command == "/last":
+        return last_command(args)
     if command == "/new":
         return new_command(args)
     if command == "/delete":
