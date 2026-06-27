@@ -35,6 +35,7 @@ from codex_bridge_client import (
     prepare_bridge_approval,
     run_codex,
     session_title,
+    start_text,
 )
 
 
@@ -110,6 +111,20 @@ QQ_ALLOWED_USER_OPENIDS = env_csv("QQ_ALLOWED_USER_OPENIDS")
 QQ_ALLOWED_GROUP_OPENIDS = env_csv("QQ_ALLOWED_GROUP_OPENIDS")
 QQ_BUTTON_ACTION_TYPE = env_int("QQ_BUTTON_ACTION_TYPE", 2)
 QQ_BUTTON_AUTO_ENTER = env_bool("QQ_BUTTON_AUTO_ENTER", True)
+QQ_SEND_STARTUP_TO_ALLOWED_USERS = env_bool("QQ_SEND_STARTUP_TO_ALLOWED_USERS", True)
+auto_start_sent_contacts: Set[str] = set()
+auto_start_lock = threading.Lock()
+
+
+def mark_auto_start_sent(contact_id: str) -> bool:
+    contact_id = str(contact_id or "").strip()
+    if not contact_id:
+        return False
+    with auto_start_lock:
+        if contact_id in auto_start_sent_contacts:
+            return False
+        auto_start_sent_contacts.add(contact_id)
+        return True
 
 
 def is_cancel_command(text: str) -> bool:
@@ -533,6 +548,123 @@ def build_model_card() -> Dict[str, Any]:
     }
 
 
+def build_start_card() -> Dict[str, Any]:
+    runtime = current_runtime()
+    rows = [
+        {
+            "buttons": [
+                keyboard_button("Codex会话列表", "/resume", button_id="start-resume", style=1),
+                keyboard_button("模型设置", "/model", button_id="start-model", style=1),
+            ]
+        },
+        {
+            "buttons": [
+                keyboard_button("用户信息", "/whoami", button_id="start-whoami", style=0),
+                keyboard_button("状态", "/status", button_id="start-status", style=0),
+                keyboard_button("帮助", "/help", button_id="start-help", style=0),
+            ]
+        },
+    ]
+    return {
+        "markdown": "\n".join([
+            "Codex Remote Bridge",
+            "我是你的远程 Codex 助手，可以通过 QQ 帮你查看和切换 Codex 会话、继续对话、调整模型、查看状态，并把需要审批的操作发回给你确认。",
+            f"model: {runtime['model']}",
+            f"reasoning: {runtime['reasoning_effort']}",
+            "点击按钮开始使用。",
+        ]),
+        "keyboard": {"rows": rows},
+    }
+
+
+def send_startup_start_messages(api: "QQApi") -> None:
+    if not QQ_SEND_STARTUP_TO_ALLOWED_USERS:
+        print("[qq-startup-start] skipped by QQ_SEND_STARTUP_TO_ALLOWED_USERS=0", flush=True)
+        return
+    if not QQ_ALLOWED_USER_OPENIDS:
+        print("[qq-startup-start] skipped because QQ_ALLOWED_USER_OPENIDS is empty", flush=True)
+        return
+
+    for index, openid in enumerate(sorted(QQ_ALLOWED_USER_OPENIDS), 1):
+        reply = {"kind": "c2c", "openid": openid}
+        contact_id = "qq:c2c:" + openid[:12]
+        card = build_start_card()
+        try:
+            api.send_markdown_keyboard(reply, card["markdown"], card["keyboard"], index)
+            mark_auto_start_sent(contact_id)
+            print(f"[qq-startup-start] sent markdown to user={openid[:12]}", flush=True)
+            continue
+        except Exception as exc:
+            print(f"[qq-startup-start-error] markdown user={openid[:12]} {exc}", flush=True)
+
+        try:
+            api.send_message(reply, start_text(), index)
+            mark_auto_start_sent(contact_id)
+            print(f"[qq-startup-start] sent text to user={openid[:12]}", flush=True)
+        except Exception as exc:
+            print(f"[qq-startup-start-error] text user={openid[:12]} {exc}", flush=True)
+
+
+def build_recent_card() -> Dict[str, Any]:
+    return {
+        "markdown": "选择要查看的会话内容范围。也可以手动发送 /recent N，N=1-10。",
+        "keyboard": {
+            "rows": [
+                {
+                    "buttons": [
+                        keyboard_button("最近4条", "/recent", button_id="recent-4", style=1),
+                        keyboard_button("最近3条", "/recent 3", button_id="recent-3", style=1),
+                        keyboard_button("最近10条", "/recent 10", button_id="recent-10", style=0),
+                    ]
+                },
+                {
+                    "buttons": [
+                        keyboard_button("我上一句", "/last user", button_id="recent-last-user", style=0),
+                        keyboard_button("Codex上一句", "/last codex", button_id="recent-last-codex", style=0),
+                    ]
+                },
+                {
+                    "buttons": [
+                        keyboard_button("会话列表", "/resume", button_id="recent-resume", style=0),
+                    ]
+                },
+            ]
+        },
+    }
+
+
+def build_resume_switched_card(session_id: str) -> Dict[str, Any]:
+    short = short_id(session_id, 8)
+    return {
+        "markdown": "\n".join([
+            "已切换 Codex 会话",
+            f"id: {short}",
+            "可以直接查看最近对话内容。",
+        ]),
+        "keyboard": {
+            "rows": [
+                {
+                    "buttons": [
+                        keyboard_button("查看最近对话内容", "/recent", button_id=f"resume-recent-{short}", style=1),
+                    ]
+                },
+                {
+                    "buttons": [
+                        keyboard_button("最近3条", "/recent 3", button_id=f"resume-recent3-{short}", style=0),
+                        keyboard_button("最近10条", "/recent 10", button_id=f"resume-recent10-{short}", style=0),
+                    ]
+                },
+                {
+                    "buttons": [
+                        keyboard_button("我上一句", "/last user", button_id=f"resume-last-user-{short}", style=0),
+                        keyboard_button("Codex上一句", "/last codex", button_id=f"resume-last-codex-{short}", style=0),
+                    ]
+                },
+            ]
+        },
+    }
+
+
 def build_approval_card(item: Dict[str, Any]) -> Dict[str, Any]:
     item_id = str(item.get("id", "")).strip()
     source = re.sub(r"\s+", " ", str(item.get("user_text", "")).strip())
@@ -830,12 +962,27 @@ def event_debug_summary(event_type: str, data: Any) -> str:
 
 def command_card(text: str) -> Optional[Dict[str, Any]]:
     command, args = split_command(text)
+    if command == "/start":
+        return build_start_card()
     if command == "/resume":
         parsed = parse_resume_args(args)
         if parsed["mode"] in {"groups", "sessions"}:
             return build_resume_card(args)
     if command == "/model":
         return build_model_card()
+    return None
+
+
+def post_command_card(text: str, command_reply: str) -> Optional[Dict[str, Any]]:
+    command, _ = split_command(text)
+    if command == "/resume" and command_reply.startswith("已切换到 Codex 原生会话："):
+        first_line = command_reply.splitlines()[0]
+        _, _, session_id = first_line.partition("：")
+        session_id = session_id.strip()
+        if re.fullmatch(r"[A-Za-z0-9_.-]{4,120}", session_id):
+            return build_resume_switched_card(session_id)
+    if command in {"/recent", "/last"} and not command_reply.startswith("当前没有 active"):
+        return build_recent_card()
     return None
 
 
@@ -861,6 +1008,13 @@ def send_command_reply(api: QQApi, reply: Dict[str, str], text: str, msg_seq: in
         except Exception as exc:
             print(f"[qq-send-command-error] {exc}", flush=True)
             break
+    followup_card = post_command_card(text, command_reply)
+    if followup_card is not None:
+        try:
+            api.send_markdown_keyboard(reply, followup_card["markdown"], followup_card["keyboard"], seq)
+            seq += 1
+        except Exception as exc:
+            print(f"[qq-send-followup-card-error] {exc}", flush=True)
     return seq
 
 
@@ -874,6 +1028,12 @@ def worker_loop(api: QQApi, jobs: "queue.Queue[Dict[str, Any]]", stop_event: thr
         print(f"[job] {job['event_type']} from={job['from']} chars={len(job['text'])}", flush=True)
         seq = 1
         command_name, _ = split_command(job["text"])
+        if command_name == "/start":
+            mark_auto_start_sent(str(job.get("from", "")))
+        if command_name != "/start" and mark_auto_start_sent(str(job.get("from", ""))):
+            seq = send_command_reply(api, job["reply"], "/start", seq)
+            print(f"[qq-send-auto-start] event={job['event_type']} from={job['from']}", flush=True)
+
         if command_name in {"/allow", "/revise"} and QQ_SEND_PROCESSING_MESSAGE:
             status_text = "收到，正在执行已批准操作。" if command_name == "/allow" else "收到，正在重新生成审批计划。"
             try:
@@ -903,6 +1063,14 @@ def worker_loop(api: QQApi, jobs: "queue.Queue[Dict[str, Any]]", stop_event: thr
                 except Exception as exc:
                     print(f"[qq-send-command-error] {exc}", flush=True)
                     break
+            followup_card = post_command_card(job["text"], command_reply)
+            if followup_card is not None:
+                try:
+                    api.send_markdown_keyboard(job["reply"], followup_card["markdown"], followup_card["keyboard"], seq)
+                    print(f"[qq-send-followup-card] event={job['event_type']} text={job['text']}", flush=True)
+                    seq += 1
+                except Exception as exc:
+                    print(f"[qq-send-followup-card-error] {exc}", flush=True)
             jobs.task_done()
             continue
 
@@ -1188,6 +1356,7 @@ def main() -> int:
         f"events={','.join(sorted(QQ_ALLOWED_EVENTS))}",
         flush=True,
     )
+    send_startup_start_messages(api)
 
     try:
         while True:
