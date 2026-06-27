@@ -126,6 +126,8 @@ client/data/qq-gateway-autostart.log
 /reject [id]                  拒绝待审批请求
 /revise [id] <instruction>    修改待审批请求
 /cancel                       取消当前 Codex 任务或待审批请求
+/cancel <task_id>             取消指定 Codex 任务
+/tasks                        查看运行中和排队中的 Codex 任务
 /restart                      重启 QQ Gateway 客户端
 /resume                       列出 Codex 原生会话
 /resume page 2                列出第 2 页
@@ -162,6 +164,18 @@ QQ_SEND_IMAGE_MAX_BYTES=10485760
 ```
 
 长任务默认 30 分钟超时，可用 `/timeout 45` 在线调整。
+
+### 任务队列和半全量输出
+
+普通 Codex 消息会进入本地任务队列并立即返回 `task_id`。同一个 Codex 会话按顺序执行，不同会话最多并发执行 `QQ_CODEX_MAX_PARALLEL` 个任务。运行中任务会定期发送状态心跳；如果 Codex JSONL 事件里出现阶段性 assistant 消息，桥接器会按间隔发送阶段性输出，最后仍发送完整最终结果。
+
+```env
+QQ_JOB_QUEUE_SIZE=20
+QQ_CODEX_MAX_PARALLEL=2
+QQ_TASK_STATUS_INTERVAL_SECONDS=60
+QQ_TASK_PARTIAL_INTERVAL_SECONDS=60
+QQ_TASK_PARTIAL_MAX_CHARS=1200
+```
 
 ### 权限映射
 
@@ -300,6 +314,8 @@ Messages starting with `/` are handled locally by the bridge and are not sent to
 /reject [id]                  Reject a pending request
 /revise [id] <instruction>    Revise a pending request
 /cancel                       Cancel current Codex task or pending request
+/cancel <task_id>             Cancel a specific Codex task
+/tasks                        Show running and queued Codex tasks
 /restart                      Restart the QQ Gateway client
 /resume                       List native Codex sessions
 /resume page 2                List page 2
@@ -336,6 +352,18 @@ QQ_SEND_IMAGE_MAX_BYTES=10485760
 ```
 
 Long Codex tasks default to a 30-minute timeout. Use `/timeout 45` to adjust it at runtime.
+
+### Task Queue and Semi-Streaming
+
+Normal Codex messages are enqueued and immediately return a `task_id`. Tasks for the same Codex session run sequentially, while different sessions may run concurrently up to `QQ_CODEX_MAX_PARALLEL`. Running tasks periodically send heartbeat status messages. If Codex JSONL emits intermediate assistant messages, the bridge sends partial updates at a controlled interval and still sends the final full result.
+
+```env
+QQ_JOB_QUEUE_SIZE=20
+QQ_CODEX_MAX_PARALLEL=2
+QQ_TASK_STATUS_INTERVAL_SECONDS=60
+QQ_TASK_PARTIAL_INTERVAL_SECONDS=60
+QQ_TASK_PARTIAL_MAX_CHARS=1200
+```
 
 ### Permission Mapping
 

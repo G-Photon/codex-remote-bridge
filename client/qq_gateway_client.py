@@ -27,6 +27,7 @@ from codex_bridge_client import (
     cancel_current_task,
     current_runtime,
     handle_bridge_command,
+    job_session_key,
     list_native_sessions,
     load_state,
     load_dotenv,
@@ -99,6 +100,10 @@ QQ_GATEWAY_INTENTS = parse_intents(os.getenv("QQ_GATEWAY_INTENTS", str(DEFAULT_I
 QQ_REPLY_MAX_CHARS = env_int("QQ_REPLY_MAX_CHARS", 1500)
 QQ_MAX_REPLY_CHUNKS = max(1, min(5, env_int("QQ_MAX_REPLY_CHUNKS", 5)))
 QQ_JOB_QUEUE_SIZE = env_int("QQ_JOB_QUEUE_SIZE", 5)
+QQ_CODEX_MAX_PARALLEL = max(1, min(6, env_int("QQ_CODEX_MAX_PARALLEL", 2)))
+QQ_TASK_STATUS_INTERVAL_SECONDS = max(15, env_int("QQ_TASK_STATUS_INTERVAL_SECONDS", 60))
+QQ_TASK_PARTIAL_INTERVAL_SECONDS = max(15, env_int("QQ_TASK_PARTIAL_INTERVAL_SECONDS", 60))
+QQ_TASK_PARTIAL_MAX_CHARS = max(200, env_int("QQ_TASK_PARTIAL_MAX_CHARS", 1200))
 QQ_RECONNECT_SECONDS = env_int("QQ_RECONNECT_SECONDS", 5)
 QQ_DEDUP_SECONDS = env_int("QQ_DEDUP_SECONDS", 600)
 QQ_SEND_PROCESSING_MESSAGE = env_bool("QQ_SEND_PROCESSING_MESSAGE", True)
@@ -1232,6 +1237,243 @@ def send_text_and_images(
     return seq
 
 
+task_lock = threading.RLock()
+task_sequence = 0
+tasks: Dict[str, Dict[str, Any]] = {}
+session_locks: Dict[str, threading.Lock] = {}
+codex_parallel = threading.Semaphore(QQ_CODEX_MAX_PARALLEL)
+
+
+def next_task_id() -> str:
+    global task_sequence
+    with task_lock:
+        task_sequence += 1
+        return f"t{task_sequence:04d}"
+
+
+def short_task_id(task_id: str) -> str:
+    return (task_id or "")[-8:]
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    minutes, sec = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{sec:02d}s"
+    return f"{sec}s"
+
+
+def get_session_lock(session_key: str) -> threading.Lock:
+    with task_lock:
+        lock = session_locks.get(session_key)
+        if lock is None:
+            lock = threading.Lock()
+            session_locks[session_key] = lock
+        return lock
+
+
+def tasks_text() -> str:
+    now = time.time()
+    with task_lock:
+        snapshot = list(tasks.values())
+    if not snapshot:
+        return "当前没有运行中或排队中的 Codex 任务。"
+    order = {"running": 0, "queued-capacity": 1, "queued-session": 2, "queued": 3, "done": 4, "failed": 5, "cancelled": 6}
+    snapshot.sort(key=lambda item: (order.get(str(item.get("status")), 9), float(item.get("created_at", 0))))
+    lines = [f"Codex 任务：{len(snapshot)} 个"]
+    for item in snapshot[:20]:
+        status = str(item.get("status", ""))
+        age = format_duration(now - float(item.get("started_at") or item.get("created_at") or now))
+        title = re.sub(r"\s+", " ", str(item.get("text", ""))).strip()[:40]
+        label = {
+            "queued-capacity": "排队等并发位",
+            "queued-session": "排队等同会话",
+            "queued": "排队中",
+            "running": "运行中",
+            "done": "已完成",
+            "failed": "失败",
+            "cancelled": "已取消",
+        }.get(status, status)
+        lines.append(f"- {item.get('id')} | {label} | {age} | session={str(item.get('session_key', ''))[-12:]} | {title}")
+    lines.append("用法：/cancel <task_id> 取消指定任务。")
+    return "\n".join(lines)
+
+
+def extract_agent_message(event: Dict[str, Any]) -> str:
+    event_type = str(event.get("type") or "")
+    if event_type == "item.completed":
+        item = event.get("item")
+        if isinstance(item, dict) and item.get("type") == "agent_message":
+            return str(item.get("text") or "").strip()
+    if event_type == "response_item":
+        payload = event.get("payload")
+        if isinstance(payload, dict) and payload.get("type") == "message":
+            content = payload.get("content")
+            if isinstance(content, list):
+                parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") in {"output_text", "text"}:
+                        text = str(part.get("text") or "").strip()
+                        if text:
+                            parts.append(text)
+                return "\n".join(parts).strip()
+    return ""
+
+
+def update_task(task_id: str, **updates: Any) -> None:
+    with task_lock:
+        item = tasks.get(task_id)
+        if item is not None:
+            item.update(updates)
+
+
+def cleanup_finished_tasks(max_age_seconds: int = 3600) -> None:
+    now = time.time()
+    with task_lock:
+        for task_id, item in list(tasks.items()):
+            if item.get("status") in {"done", "failed", "cancelled"}:
+                ended_at = float(item.get("ended_at") or now)
+                if now - ended_at > max_age_seconds:
+                    del tasks[task_id]
+
+
+def task_event_callback(task_id: str, api: QQApi, reply: Dict[str, str]):
+    def on_event(event: Dict[str, Any]) -> None:
+        message = extract_agent_message(event)
+        if not message:
+            return
+        now = time.time()
+        send_partial = False
+        with task_lock:
+            item = tasks.get(task_id)
+            if not item:
+                return
+            item["last_agent_message"] = message
+            last_sent_text = str(item.get("last_partial_text", ""))
+            last_sent_at = float(item.get("last_partial_at") or 0)
+            if message != last_sent_text and now - last_sent_at >= QQ_TASK_PARTIAL_INTERVAL_SECONDS:
+                item["last_partial_text"] = message
+                item["last_partial_at"] = now
+                seq = int(item.get("next_seq", 1))
+                item["next_seq"] = seq + 1
+                send_partial = True
+            else:
+                seq = 0
+        if send_partial:
+            preview = message.strip()
+            if len(preview) > QQ_TASK_PARTIAL_MAX_CHARS:
+                preview = preview[:QQ_TASK_PARTIAL_MAX_CHARS].rstrip() + "\n[阶段性输出已截断]"
+            try:
+                api.send_message(reply, f"阶段性输出 {task_id}：\n{preview}", seq)
+                print(f"[task-partial] id={task_id} chars={len(preview)}", flush=True)
+            except Exception as exc:
+                print(f"[task-partial-error] id={task_id} {exc}", flush=True)
+
+    return on_event
+
+
+def task_status_loop(task_id: str, api: QQApi, reply: Dict[str, str], stop_event: threading.Event) -> None:
+    while not stop_event.wait(QQ_TASK_STATUS_INTERVAL_SECONDS):
+        with task_lock:
+            item = tasks.get(task_id)
+            if not item or item.get("status") != "running":
+                return
+            seq = int(item.get("next_seq", 1))
+            item["next_seq"] = seq + 1
+            started_at = float(item.get("started_at") or time.time())
+        try:
+            api.send_message(reply, f"任务 {task_id} 仍在运行，已用 {format_duration(time.time() - started_at)}。/tasks 查看，/cancel {task_id} 取消。", seq)
+            print(f"[task-heartbeat] id={task_id}", flush=True)
+        except Exception as exc:
+            print(f"[task-heartbeat-error] id={task_id} {exc}", flush=True)
+
+
+def run_task(task_id: str, api: QQApi) -> None:
+    with task_lock:
+        item = tasks.get(task_id)
+        if not item:
+            return
+        job = item["job"]
+        reply = job["reply"]
+        session_key = str(item.get("session_key", ""))
+    session_lock = get_session_lock(session_key)
+    update_task(task_id, status="queued-session")
+    with session_lock:
+        with task_lock:
+            if tasks.get(task_id, {}).get("status") == "cancelled":
+                return
+        update_task(task_id, status="queued-capacity")
+        with codex_parallel:
+            with task_lock:
+                if tasks.get(task_id, {}).get("status") == "cancelled":
+                    return
+            cleanup_finished_tasks()
+            stop_event = threading.Event()
+            with task_lock:
+                item = tasks.get(task_id)
+                if not item:
+                    return
+                item.update({"status": "running", "started_at": time.time(), "next_seq": max(2, int(item.get("next_seq", 2)))})
+            threading.Thread(target=task_status_loop, args=(task_id, api, reply, stop_event), name=f"task-status-{task_id}", daemon=True).start()
+            try:
+                history_extra = str(job.get("attachments_text", "")).strip()
+                append_history("User", f"[{job['from']}]\n{job['text']}\n{history_extra}".strip())
+                answer = run_codex(job, on_event=task_event_callback(task_id, api, reply))
+                append_history("Codex", answer)
+                with task_lock:
+                    item = tasks.get(task_id)
+                    seq = int(item.get("next_seq", 2)) if item else 2
+                    if item:
+                        item["next_seq"] = seq + 1
+                send_text_and_images(api, reply, answer, seq, QQ_MAX_REPLY_CHUNKS, "qq-send-answer")
+                update_task(task_id, status="done", ended_at=time.time())
+            except Exception as exc:
+                answer = f"Codex 调用失败：{exc}"
+                append_history("BridgeError", str(exc))
+                with task_lock:
+                    item = tasks.get(task_id)
+                    seq = int(item.get("next_seq", 2)) if item else 2
+                    if item:
+                        item["next_seq"] = seq + 1
+                try:
+                    api.send_message(reply, answer, seq)
+                except Exception as send_exc:
+                    print(f"[task-error-send-failed] id={task_id} {send_exc}", flush=True)
+                update_task(task_id, status="failed", error=str(exc), ended_at=time.time())
+            finally:
+                stop_event.set()
+
+
+def enqueue_codex_task(api: QQApi, job: Dict[str, Any], first_seq: int) -> None:
+    task_id = next_task_id()
+    job["id"] = task_id
+    try:
+        session_key = job_session_key(job)
+    except Exception:
+        session_key = "unknown"
+    with task_lock:
+        tasks[task_id] = {
+            "id": task_id,
+            "job": job,
+            "reply": job["reply"],
+            "text": job.get("text", ""),
+            "from": job.get("from", ""),
+            "session_key": session_key,
+            "status": "queued",
+            "created_at": time.time(),
+            "next_seq": first_seq + 1,
+        }
+        ahead = sum(1 for item in tasks.values() if item.get("status") in {"queued", "queued-session", "queued-capacity"})
+    try:
+        api.send_message(job["reply"], f"已加入 Codex 任务队列：{task_id}\n排队中：{ahead} 个。/tasks 查看，/cancel {task_id} 取消。", first_seq)
+    except Exception as exc:
+        print(f"[task-queued-send-error] id={task_id} {exc}", flush=True)
+    threading.Thread(target=run_task, args=(task_id, api), name=f"codex-task-{task_id}", daemon=True).start()
+
+
 def event_debug_summary(event_type: str, data: Any) -> str:
     if not isinstance(data, dict):
         return f"event={event_type} data_type={type(data).__name__}"
@@ -1252,6 +1494,24 @@ def command_card(text: str) -> Optional[Dict[str, Any]]:
             return build_resume_card(args)
     if command == "/model":
         return build_model_card()
+    return None
+
+
+def local_gateway_command_reply(text: str) -> Optional[str]:
+    command, args = split_command(text)
+    if command == "/tasks":
+        return tasks_text()
+    if command == "/cancel":
+        target = args.strip()
+        if target:
+            with task_lock:
+                item = tasks.get(target)
+                if item and item.get("status") in {"queued", "queued-session", "queued-capacity"}:
+                    item["status"] = "cancelled"
+                    item["ended_at"] = time.time()
+                    return f"已取消排队任务：{target}"
+            return cancel_current_task(target)
+        return cancel_current_task()
     return None
 
 
@@ -1277,7 +1537,9 @@ def send_command_reply(api: QQApi, reply: Dict[str, str], text: str, msg_seq: in
         except Exception as exc:
             print(f"[qq-send-card-error] {exc}", flush=True)
 
-    command_reply = handle_bridge_command(text, {"reply": reply})
+    command_reply = local_gateway_command_reply(text)
+    if command_reply is None:
+        command_reply = handle_bridge_command(text, {"reply": reply})
     if command_reply is None:
         return msg_seq
 
@@ -1336,7 +1598,9 @@ def worker_loop(api: QQApi, jobs: "queue.Queue[Dict[str, Any]]", stop_event: thr
             except Exception as exc:
                 print(f"[qq-send-command-processing-error] {exc}", flush=True)
 
-        command_reply = handle_bridge_command(job["text"], job)
+        command_reply = local_gateway_command_reply(job["text"])
+        if command_reply is None:
+            command_reply = handle_bridge_command(job["text"], job)
         if command_reply is not None:
             card = command_card(job["text"])
             if card is not None:
@@ -1393,18 +1657,7 @@ def worker_loop(api: QQApi, jobs: "queue.Queue[Dict[str, Any]]", stop_event: thr
             jobs.task_done()
             continue
 
-        history_extra = str(job.get("attachments_text", "")).strip()
-        append_history("User", f"[{job['from']}]\n{job['text']}\n{history_extra}".strip())
-        try:
-            answer = run_codex(job)
-            append_history("Codex", answer)
-        except Exception as exc:
-            answer = f"Codex 调用失败：{exc}"
-            append_history("BridgeError", str(exc))
-
-        remaining_chunks = max(1, QQ_MAX_REPLY_CHUNKS - (seq - 1))
-        seq = send_text_and_images(api, job["reply"], answer, seq, remaining_chunks, "qq-send-answer")
-
+        enqueue_codex_task(api, job, seq)
         jobs.task_done()
 
 
@@ -1580,7 +1833,8 @@ class QQGatewayClient:
             if is_cancel_command(job["text"]):
                 print(f"[gateway] immediate cancel from={job['from']}", flush=True)
                 try:
-                    self.api.send_message(job["reply"], cancel_current_task(), 1)
+                    command, args = split_command(job["text"])
+                    self.api.send_message(job["reply"], local_gateway_command_reply(job["text"]) or cancel_current_task(args), 1)
                 except Exception as exc:
                     print(f"[qq-send-cancel-error] {exc}", flush=True)
                 return

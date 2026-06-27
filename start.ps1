@@ -378,6 +378,11 @@ function Write-EnvFile {
         "QQ_ALLOWED_EVENTS=$(Get-EnvValue -Map $Existing -Key 'QQ_ALLOWED_EVENTS' -DefaultValue 'C2C_MESSAGE_CREATE,GROUP_AT_MESSAGE_CREATE')",
         "QQ_REPLY_MAX_CHARS=$(Get-EnvValue -Map $Existing -Key 'QQ_REPLY_MAX_CHARS' -DefaultValue '1500')",
         "QQ_MAX_REPLY_CHUNKS=$(Get-EnvValue -Map $Existing -Key 'QQ_MAX_REPLY_CHUNKS' -DefaultValue '5')",
+        "QQ_JOB_QUEUE_SIZE=$(Get-EnvValue -Map $Existing -Key 'QQ_JOB_QUEUE_SIZE' -DefaultValue '20')",
+        "QQ_CODEX_MAX_PARALLEL=$(Get-EnvValue -Map $Existing -Key 'QQ_CODEX_MAX_PARALLEL' -DefaultValue '2')",
+        "QQ_TASK_STATUS_INTERVAL_SECONDS=$(Get-EnvValue -Map $Existing -Key 'QQ_TASK_STATUS_INTERVAL_SECONDS' -DefaultValue '60')",
+        "QQ_TASK_PARTIAL_INTERVAL_SECONDS=$(Get-EnvValue -Map $Existing -Key 'QQ_TASK_PARTIAL_INTERVAL_SECONDS' -DefaultValue '60')",
+        "QQ_TASK_PARTIAL_MAX_CHARS=$(Get-EnvValue -Map $Existing -Key 'QQ_TASK_PARTIAL_MAX_CHARS' -DefaultValue '1200')",
         "QQ_SEND_PROCESSING_MESSAGE=$(Get-EnvValue -Map $Existing -Key 'QQ_SEND_PROCESSING_MESSAGE' -DefaultValue '1')",
         "QQ_PROCESSING_TEXT=$(Get-EnvValue -Map $Existing -Key 'QQ_PROCESSING_TEXT' -DefaultValue 'Received, processing.')",
         "QQ_SEND_STARTUP_TO_ALLOWED_USERS=$(Get-EnvValue -Map $Existing -Key 'QQ_SEND_STARTUP_TO_ALLOWED_USERS' -DefaultValue '1')",
@@ -616,6 +621,8 @@ function Show-QuickStartHelp {
     Write-Host "  /pending                      显示待批准操作"
     Write-Host "  /allow <id>                   批准待执行操作"
     Write-Host "  /cancel                       取消当前 Codex 任务"
+    Write-Host "  /cancel <task_id>             取消指定 Codex 任务"
+    Write-Host "  /tasks                        显示运行中和排队中的 Codex 任务"
     Write-Host "  /restart                      重启 QQ Gateway 客户端"
     Write-Host "  /resume                       列出 Codex 原生会话"
     Write-Host "  /new [标题]                   开启新的 Codex 会话"

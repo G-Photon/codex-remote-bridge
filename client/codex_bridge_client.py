@@ -2,6 +2,7 @@
 import json
 import hashlib
 import os
+import queue
 import re
 import shutil
 import sqlite3
@@ -13,7 +14,7 @@ import time
 import uuid
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import unquote
 
 
@@ -89,6 +90,7 @@ ALLOWED_MODELS = [
 current_codex_lock = threading.Lock()
 current_codex_proc: Optional[subprocess.Popen] = None
 current_codex_job = ""
+current_codex_tasks: Dict[str, subprocess.Popen] = {}
 approved_run = threading.local()
 
 PERMISSION_PROFILES = {
@@ -698,6 +700,16 @@ def current_runtime() -> Dict[str, Any]:
         "active_native_session_id": str(state.get("active_native_session_id", "")),
         "timeout_seconds": int(state.get("timeout_seconds", CODEX_TIMEOUT_SECONDS) or CODEX_TIMEOUT_SECONDS),
     }
+
+
+def job_session_key(job: Dict[str, Any]) -> str:
+    runtime = current_process_runtime()
+    job.setdefault("_context_mode", runtime["context_mode"])
+    job.setdefault("_active_session_id", runtime["active_session_id"])
+    job.setdefault("_active_native_session_id", runtime["active_native_session_id"])
+    if runtime["context_mode"] == "native":
+        return "native:" + (runtime["active_native_session_id"] or "new")
+    return "local:" + runtime["active_session_id"]
 
 
 def truncate_title(text: str, limit: int = 36) -> str:
@@ -1475,25 +1487,34 @@ def codex_base_cmd(runtime: Dict[str, Any], output_file: Path) -> List[str]:
     return cmd
 
 
-def cancel_current_task() -> str:
+def kill_process_tree(proc: subprocess.Popen) -> None:
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=10,
+        )
+    else:
+        proc.kill()
+
+
+def cancel_current_task(task_id: str = "") -> str:
     global current_codex_proc
+    task_id = (task_id or "").strip()
     with current_codex_lock:
-        proc = current_codex_proc
-        job = current_codex_job
+        if task_id:
+            proc = current_codex_tasks.get(task_id)
+            job = task_id
+        else:
+            proc = current_codex_proc
+            job = current_codex_job
     if not proc or proc.poll() is not None:
-        return "当前没有正在运行的 Codex 任务。"
+        return "没有找到正在运行的 Codex 任务。" if task_id else "当前没有正在运行的 Codex 任务。"
 
     try:
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=10,
-            )
-        else:
-            proc.kill()
+        kill_process_tree(proc)
     except Exception as exc:
         return f"取消失败：{exc}"
     return f"已取消当前 Codex 任务。pid={proc.pid}" + (f" job={job}" if job else "")
@@ -1511,7 +1532,12 @@ def cancel_pending_target() -> str:
     return ""
 
 
-def run_codex_process(prompt: str, session_id: str = "", job_id: str = "") -> Dict[str, str]:
+def run_codex_process(
+    prompt: str,
+    session_id: str = "",
+    job_id: str = "",
+    on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Dict[str, str]:
     global current_codex_proc, current_codex_job
     runtime = current_process_runtime()
     with tempfile.TemporaryDirectory(prefix="codex-bridge-") as tmp:
@@ -1539,23 +1565,73 @@ def run_codex_process(prompt: str, session_id: str = "", job_id: str = "") -> Di
         with current_codex_lock:
             current_codex_proc = proc
             current_codex_job = job_id
+            if job_id:
+                current_codex_tasks[job_id] = proc
+        if proc.stdin:
+            try:
+                proc.stdin.write(prompt)
+                proc.stdin.close()
+            except Exception:
+                pass
+        events: List[str] = []
+        stdout_queue: "queue.Queue[str]" = queue.Queue()
+
+        def reader() -> None:
+            if not proc.stdout:
+                return
+            for line in proc.stdout:
+                stdout_queue.put(line)
+
+        threading.Thread(target=reader, name=f"codex-json-reader-{job_id or proc.pid}", daemon=True).start()
         try:
             timeout_seconds = int(runtime.get("timeout_seconds") or CODEX_TIMEOUT_SECONDS)
-            stdout, _ = proc.communicate(input=prompt, timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            cancel_current_task()
-            stdout = ""
-            minutes = int((int(runtime.get("timeout_seconds") or CODEX_TIMEOUT_SECONDS) + 59) / 60)
-            raise RuntimeError(
-                f"Codex task timed out after {minutes} min and was cancelled. "
-                "可发送 /timeout 45 调长，或 /cancel 取消当前任务。"
-            )
+            deadline = time.time() + timeout_seconds
+            while True:
+                try:
+                    line = stdout_queue.get(timeout=0.2)
+                    events.append(line)
+                    stripped = line.strip()
+                    if stripped.startswith("{"):
+                        try:
+                            event = json.loads(stripped)
+                        except Exception:
+                            event = None
+                        if isinstance(event, dict) and on_event:
+                            on_event(event)
+                except queue.Empty:
+                    pass
+                if proc.poll() is not None:
+                    while True:
+                        try:
+                            line = stdout_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        events.append(line)
+                        stripped = line.strip()
+                        if stripped.startswith("{"):
+                            try:
+                                event = json.loads(stripped)
+                            except Exception:
+                                event = None
+                            if isinstance(event, dict) and on_event:
+                                on_event(event)
+                    break
+                if time.time() > deadline:
+                    cancel_current_task(job_id)
+                    minutes = int((timeout_seconds + 59) / 60)
+                    raise RuntimeError(
+                        f"Codex task timed out after {minutes} min and was cancelled. "
+                        "可发送 /timeout 45 调长，或 /cancel <task_id> 取消指定任务。"
+                    )
         finally:
             with current_codex_lock:
                 if current_codex_proc is proc:
                     current_codex_proc = None
                     current_codex_job = ""
+                if job_id and current_codex_tasks.get(job_id) is proc:
+                    del current_codex_tasks[job_id]
 
+        stdout = "".join(events)
         result = ""
         if output_file.exists():
             result = output_file.read_text(encoding="utf-8", errors="replace").strip()
@@ -1722,6 +1798,8 @@ def help_text() -> str:
         "/model gpt-5.5 high - 切换模型和思考强度",
         "/model gpt-5.4 xhigh - 支持 gpt-5.5 / gpt-5.4；思考强度 none/minimal/low/medium/high/xhigh",
         "/cancel - 取消当前正在运行的 Codex 任务",
+        "/cancel <task_id> - 取消指定 Codex 任务",
+        "/tasks - 查看运行中和排队中的 Codex 任务",
         "/timeout - 查看 Codex 单次调用超时",
         "/timeout 45 - 设置单次调用超时为 45 分钟",
         "/restart - 重启 QQ Gateway 客户端",
@@ -2045,11 +2123,12 @@ def handle_bridge_command(text: str, job: Optional[Dict[str, Any]] = None) -> Op
         return result
     return "未知指令。发送 /help 查看可用指令。"
 
-def run_codex_prompt_mode(job: Dict[str, Any]) -> str:
+def run_codex_prompt_mode(job: Dict[str, Any], on_event: Optional[Callable[[Dict[str, Any]], None]] = None) -> str:
     remote_text = job.get("text", "")
     attachments_text = str(job.get("attachments_text", "")).strip()
     runtime = current_process_runtime()
-    history = read_history_tail(runtime["active_session_id"])
+    active_session_id = str(job.get("_active_session_id") or runtime["active_session_id"])
+    history = read_history_tail(active_session_id)
     profile = runtime["permission_profile"]
     prompt = f"""你正在通过 QQ 远程消息桥接和用户对话。
 
@@ -2061,7 +2140,7 @@ def run_codex_prompt_mode(job: Dict[str, Any]) -> str:
 - 如果需要把本地图片发回 QQ，请单独输出一行：SEND_IMAGE: <本地图片绝对路径>。
 - 必要上下文在下面的当前会话历史片段里。
 
-当前会话：{runtime['active_session_id']}
+当前会话：{active_session_id}
 当前会话历史片段：
 {history}
 
@@ -2069,12 +2148,12 @@ def run_codex_prompt_mode(job: Dict[str, Any]) -> str:
 {remote_text}
 {attachments_text}
 """
-    return run_codex_process(prompt, "", str(job.get("id", ""))).get("text", "")
+    return run_codex_process(prompt, "", str(job.get("id", "")), on_event=on_event).get("text", "")
 
 
-def run_codex_native_mode(job: Dict[str, Any]) -> str:
+def run_codex_native_mode(job: Dict[str, Any], on_event: Optional[Callable[[Dict[str, Any]], None]] = None) -> str:
     state = load_state()
-    session_id = str(state.get("active_native_session_id", ""))
+    session_id = str(job.get("_active_native_session_id") or state.get("active_native_session_id", ""))
     remote_text = job.get("text", "")
     attachments_text = str(job.get("attachments_text", "")).strip()
     prompt = f"""你正在通过 QQ 远程消息桥接和用户对话。
@@ -2089,7 +2168,7 @@ def run_codex_native_mode(job: Dict[str, Any]) -> str:
 {remote_text}
 {attachments_text}
 """
-    result = run_codex_process(prompt, session_id, str(job.get("id", "")))
+    result = run_codex_process(prompt, session_id, str(job.get("id", "")), on_event=on_event)
     thread_id = result.get("thread_id", "")
     if thread_id:
         state = load_state()
@@ -2099,7 +2178,7 @@ def run_codex_native_mode(job: Dict[str, Any]) -> str:
     return result["text"]
 
 
-def run_codex(job: Dict[str, Any]) -> str:
+def run_codex(job: Dict[str, Any], on_event: Optional[Callable[[Dict[str, Any]], None]] = None) -> str:
     if current_process_runtime()["context_mode"] == "native":
-        return run_codex_native_mode(job)
-    return run_codex_prompt_mode(job)
+        return run_codex_native_mode(job, on_event=on_event)
+    return run_codex_prompt_mode(job, on_event=on_event)
