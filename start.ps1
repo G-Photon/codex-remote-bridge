@@ -6,6 +6,8 @@
 )
 
 $ErrorActionPreference = "Stop"
+$script:InstallProxyPreferenceChecked = $false
+$script:InstallProxy = ""
 
 function Write-Step {
     param([string]$Message)
@@ -33,9 +35,9 @@ function Confirm-Action {
         [string]$Question,
         [bool]$DefaultYes = $false
     )
-    $suffix = "[y/N]"
+    $suffix = "[y/N，默认否]"
     if ($DefaultYes) {
-        $suffix = "[Y/n]"
+        $suffix = "[Y/n，默认是]"
     }
     $answer = Read-Host "$Question $suffix"
     if ([string]::IsNullOrWhiteSpace($answer)) {
@@ -58,7 +60,7 @@ function Read-YesNoNever {
         if ($normalized -eq "never") {
             return "never"
         }
-        Write-WarnLine "Please enter y, n, or never."
+        Write-WarnLine "请输入 y、n 或 never。"
     }
 }
 
@@ -66,24 +68,204 @@ function Invoke-Logged {
     param(
         [string]$FilePath,
         [string[]]$ArgumentList,
-        [string]$WorkingDirectory = $PSScriptRoot
+        [string]$WorkingDirectory = $PSScriptRoot,
+        [string]$Activity = "正在执行命令"
     )
     Write-Host "> $FilePath $($ArgumentList -join ' ')" -ForegroundColor DarkGray
-    Push-Location -LiteralPath $WorkingDirectory
+    Write-Progress -Activity $Activity -Status "准备开始..." -PercentComplete 0
     try {
-        & $FilePath @ArgumentList
-        $exitCode = $LASTEXITCODE
+        $process = Start-Process `
+            -FilePath $FilePath `
+            -ArgumentList $ArgumentList `
+            -WorkingDirectory $WorkingDirectory `
+            -NoNewWindow `
+            -PassThru
+
+        $started = Get-Date
+        while (-not $process.HasExited) {
+            $elapsed = [int]((Get-Date) - $started).TotalSeconds
+            $percent = [Math]::Min(95, 5 + $elapsed)
+            Write-Progress `
+                -Activity $Activity `
+                -Status "正在执行，已用 $elapsed 秒。安装器可能正在下载，请不要关闭窗口。" `
+                -PercentComplete $percent
+            Start-Sleep -Seconds 1
+            $process.Refresh()
+        }
+        $exitCode = $process.ExitCode
     } finally {
-        Pop-Location
+        Write-Progress -Activity $Activity -Completed
     }
     if ($exitCode -ne 0) {
-        throw "Command failed with exit code ${exitCode}: $FilePath"
+        throw "命令执行失败，退出码 ${exitCode}：$FilePath"
     }
 }
 
 function Test-Command {
     param([string]$Name)
-    return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
+    try {
+        return $null -ne (Get-Command $Name -ErrorAction Stop)
+    } catch {
+        return $false
+    }
+}
+
+function Add-ProxyCandidate {
+    param(
+        [System.Collections.Generic.List[string]]$Candidates,
+        [string]$Value
+    )
+    $value = ([string]$Value).Trim()
+    if (-not $value -or $value -match "^(?:none|null|direct)$") {
+        return
+    }
+    if ($value -notmatch "^[a-zA-Z][a-zA-Z0-9+.-]*://") {
+        $value = "http://$value"
+    }
+    if (-not $Candidates.Contains($value)) {
+        $Candidates.Add($value) | Out-Null
+    }
+}
+
+function Format-ProxyForDisplay {
+    param([string]$Proxy)
+    return ($Proxy -replace "(://[^:/@]+):([^@]+)@", '$1:***@')
+}
+
+function Get-ProxyCandidates {
+    $candidates = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($name in @("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy")) {
+        Add-ProxyCandidate -Candidates $candidates -Value ([Environment]::GetEnvironmentVariable($name))
+    }
+
+    try {
+        $internetSettings = Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -ErrorAction Stop
+        if ([int]$internetSettings.ProxyEnable -eq 1) {
+            $proxyServer = [string]$internetSettings.ProxyServer
+            if ($proxyServer) {
+                foreach ($part in $proxyServer -split ";") {
+                    $candidate = $part
+                    if ($candidate -match "=") {
+                        $candidate = ($candidate -split "=", 2)[1]
+                    }
+                    Add-ProxyCandidate -Candidates $candidates -Value $candidate
+                }
+            }
+        }
+    } catch {
+    }
+
+    if (Test-Command "git") {
+        foreach ($key in @("http.proxy", "https.proxy")) {
+            try {
+                $value = (& git config --get $key 2>$null)
+                if ($LASTEXITCODE -eq 0) {
+                    Add-ProxyCandidate -Candidates $candidates -Value $value
+                }
+            } catch {
+            }
+        }
+    }
+
+    if (Test-Command "npm") {
+        foreach ($key in @("https-proxy", "proxy")) {
+            try {
+                $value = (& npm config get $key 2>$null)
+                if ($LASTEXITCODE -eq 0) {
+                    Add-ProxyCandidate -Candidates $candidates -Value $value
+                }
+            } catch {
+            }
+        }
+    }
+
+    try {
+        $winHttp = (& netsh winhttp show proxy 2>$null) -join "`n"
+        foreach ($match in [regex]::Matches($winHttp, "(https?://[^\s;]+|(?:127\.0\.0\.1|localhost|\d{1,3}(?:\.\d{1,3}){3}):\d+)")) {
+            Add-ProxyCandidate -Candidates $candidates -Value $match.Value
+        }
+    } catch {
+    }
+
+    return @($candidates)
+}
+
+function Use-InstallProxy {
+    param([string]$Proxy)
+    $script:InstallProxy = $Proxy
+    foreach ($name in @("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")) {
+        [Environment]::SetEnvironmentVariable($name, $Proxy, "Process")
+    }
+    Write-Ok "本次下载安装将使用代理：$(Format-ProxyForDisplay $Proxy)"
+}
+
+function Ensure-InstallProxyPreference {
+    if ($script:InstallProxyPreferenceChecked) {
+        return
+    }
+    $script:InstallProxyPreferenceChecked = $true
+
+    Write-Step "检查下载代理"
+    $candidates = @(Get-ProxyCandidates)
+    if ($candidates.Count -eq 0) {
+        Write-WarnLine "未检测到本地代理配置。"
+        $manual = Read-Host "如需使用代理下载安装，请输入代理地址；直接回车表示不使用代理"
+        $manual = $manual.Trim()
+        if ($manual) {
+            if ($manual -notmatch "^[a-zA-Z][a-zA-Z0-9+.-]*://") {
+                $manual = "http://$manual"
+            }
+            Use-InstallProxy -Proxy $manual
+        } else {
+            Write-Host "本次下载安装不使用代理。"
+        }
+        return
+    }
+
+    Write-Host "检测到以下本地代理配置："
+    for ($i = 0; $i -lt $candidates.Count; $i++) {
+        Write-Host "  $($i + 1). $(Format-ProxyForDisplay $candidates[$i])"
+    }
+    while ($true) {
+        $answer = Read-Host "是否使用代理下载安装？回车或 y 使用第 1 个；输入序号选择；输入 n 不使用；也可以直接粘贴代理地址"
+        $normalized = $answer.Trim()
+        if ([string]::IsNullOrWhiteSpace($normalized) -or $normalized.ToLowerInvariant() -in @("y", "yes", "是", "好", "确认")) {
+            Use-InstallProxy -Proxy $candidates[0]
+            return
+        }
+        if ($normalized.ToLowerInvariant() -in @("n", "no", "否", "不")) {
+            Write-Host "本次下载安装不使用脚本检测到的代理。"
+            return
+        }
+        $index = 0
+        if ([int]::TryParse($normalized, [ref]$index) -and $index -ge 1 -and $index -le $candidates.Count) {
+            Use-InstallProxy -Proxy $candidates[$index - 1]
+            return
+        }
+        if ($normalized -match "^[a-zA-Z][a-zA-Z0-9+.-]*://|^(?:127\.0\.0\.1|localhost|\d{1,3}(?:\.\d{1,3}){3}):\d+") {
+            if ($normalized -notmatch "^[a-zA-Z][a-zA-Z0-9+.-]*://") {
+                $normalized = "http://$normalized"
+            }
+            Use-InstallProxy -Proxy $normalized
+            return
+        }
+        Write-WarnLine "输入无法识别，请输入 y、n、序号，或代理地址。"
+    }
+}
+
+function Get-PipProxyArgs {
+    if ([string]::IsNullOrWhiteSpace($script:InstallProxy)) {
+        return @()
+    }
+    return @("--proxy", $script:InstallProxy)
+}
+
+function Get-NpmProxyArgs {
+    if ([string]::IsNullOrWhiteSpace($script:InstallProxy)) {
+        return @()
+    }
+    return @("--proxy", $script:InstallProxy, "--https-proxy", $script:InstallProxy)
 }
 
 function Get-TailArgs {
@@ -113,6 +295,21 @@ function Resolve-PythonCommand {
         } catch {
         }
     }
+    if (Test-Command "conda") {
+        try {
+            $condaBase = (& conda info --base 2>$null).Trim()
+            if ($LASTEXITCODE -eq 0 -and $condaBase) {
+                $condaPython = Join-Path $condaBase "python.exe"
+                if (Test-Path -LiteralPath $condaPython) {
+                    $version = & $condaPython --version 2>&1
+                    if ($LASTEXITCODE -eq 0 -and "$version" -match "Python\s+3\.") {
+                        return @($condaPython)
+                    }
+                }
+            }
+        } catch {
+        }
+    }
     return @()
 }
 
@@ -133,83 +330,153 @@ function Invoke-Python {
     }
 }
 
+function Invoke-PythonLogged {
+    param(
+        [string[]]$PythonCommand,
+        [string[]]$Arguments,
+        [string]$WorkingDirectory = $PSScriptRoot,
+        [string]$Activity = "正在执行 Python 命令"
+    )
+    $exe = $PythonCommand[0]
+    $baseArgs = Get-TailArgs -Command $PythonCommand
+    Invoke-Logged `
+        -FilePath $exe `
+        -ArgumentList ($baseArgs + $Arguments) `
+        -WorkingDirectory $WorkingDirectory `
+        -Activity $Activity
+}
+
+function Invoke-PythonCapture {
+    param(
+        [string[]]$PythonCommand,
+        [string[]]$Arguments,
+        [string]$WorkingDirectory = $PSScriptRoot
+    )
+    $exe = $PythonCommand[0]
+    $baseArgs = Get-TailArgs -Command $PythonCommand
+    Push-Location -LiteralPath $WorkingDirectory
+    try {
+        $output = & $exe @baseArgs @Arguments 2>&1
+        return [pscustomobject]@{
+            ExitCode = $LASTEXITCODE
+            Output = ($output -join "`n")
+        }
+    } catch {
+        return [pscustomobject]@{
+            ExitCode = 1
+            Output = $_.Exception.Message
+        }
+    } finally {
+        Pop-Location
+    }
+}
+
 function Ensure-WingetPackage {
     param(
         [string]$PackageId,
         [string]$DisplayName
     )
     if (-not (Test-Command "winget")) {
-        throw "winget is not available. Please install $DisplayName manually, then rerun this script."
+        throw "未检测到 winget，无法自动安装 $DisplayName。请手动安装后重新运行本脚本。"
     }
-    Invoke-Logged -FilePath "winget" -ArgumentList @("install", "--id", $PackageId, "-e", "--source", "winget", "--accept-package-agreements", "--accept-source-agreements")
+    Ensure-InstallProxyPreference
+    Invoke-Logged `
+        -FilePath "winget" `
+        -ArgumentList @("install", "--id", $PackageId, "-e", "--source", "winget", "--accept-package-agreements", "--accept-source-agreements") `
+        -Activity "正在安装 $DisplayName"
 }
 
 function Ensure-Python {
-    Write-Step "Checking Python"
+    Write-Step "检查 Python"
     $python = @(Resolve-PythonCommand)
     if ($python.Count -gt 0) {
         $exe = $python[0]
-        $version = & $exe @(Get-TailArgs -Command $python) --version 2>&1
-        Write-Ok "$version"
-        return $python
+        try {
+            $version = & $exe @(Get-TailArgs -Command $python) --version 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Ok "$version"
+                return $python
+            }
+        } catch {
+            Write-WarnLine "检测 Python 版本失败，将按未安装处理：$($_.Exception.Message)"
+        }
     }
 
-    Write-WarnLine "Python 3 was not found."
-    if (Confirm-Action "Install Python 3 with winget now?") {
+    Write-WarnLine "未检测到可用的 Python 3。"
+    if (Confirm-Action "是否现在通过 winget 自动安装 Python 3？") {
         Ensure-WingetPackage -PackageId "Python.Python.3.13" -DisplayName "Python 3"
         $python = @(Resolve-PythonCommand)
         if ($python.Count -gt 0) {
-            Write-Ok "Python installed"
+            Write-Ok "Python 已安装"
             return $python
         }
-        throw "Python was installed, but this PowerShell session cannot find it yet. Restart PowerShell and rerun this script."
+        throw "Python 已安装，但当前 PowerShell 会话暂时找不到它。请重启 PowerShell 后重新运行本脚本。"
     }
-    throw "Python 3 is required."
+    throw "需要 Python 3 才能继续。"
 }
 
 function Ensure-WebsocketClient {
     param([string[]]$PythonCommand)
-    Write-Step "Checking Python dependency: websocket-client"
+    Write-Step "检查 Python 依赖：websocket-client"
     $code = "import websocket; print(getattr(websocket, '__version__', 'installed'))"
     $exe = $PythonCommand[0]
-    $output = & $exe @(Get-TailArgs -Command $PythonCommand) -c $code 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        Write-Ok "websocket-client $output"
-        return
-    }
-
-    Write-WarnLine "Python package websocket-client is missing."
-    if (Confirm-Action "Install websocket-client for the current user now?") {
-        Invoke-Python -PythonCommand $PythonCommand -Arguments @("-m", "pip", "install", "--user", "websocket-client") | Out-Null
+    try {
         $output = & $exe @(Get-TailArgs -Command $PythonCommand) -c $code 2>&1
         if ($LASTEXITCODE -eq 0) {
             Write-Ok "websocket-client $output"
             return
         }
-        throw "websocket-client installation did not pass the import check."
+    } catch {
+        $output = $_.Exception.Message
     }
-    throw "websocket-client is required."
+
+    Write-WarnLine "缺少 Python 依赖 websocket-client。检测输出：$output"
+    if (Confirm-Action "是否现在为当前用户自动安装 websocket-client？") {
+        Ensure-InstallProxyPreference
+        $pipArgs = @("-m", "pip", "install", "--user", "--progress-bar", "on") + (Get-PipProxyArgs) + @("websocket-client")
+        Invoke-PythonLogged -PythonCommand $PythonCommand -Arguments $pipArgs -Activity "正在安装 Python 依赖 websocket-client" | Out-Null
+        try {
+            $output = & $exe @(Get-TailArgs -Command $PythonCommand) -c $code 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Ok "websocket-client $output"
+                return
+            }
+        } catch {
+            $output = $_.Exception.Message
+        }
+        throw "websocket-client 安装后仍未通过导入检查：$output"
+    }
+    throw "需要 websocket-client 才能继续。"
 }
 
 function Ensure-NodeAndNpm {
-    Write-Step "Checking Node.js and npm"
+    Write-Step "检查 Node.js 和 npm"
     if (Test-Command "node" -and Test-Command "npm") {
-        $nodeVersion = & node --version 2>&1
-        $npmVersion = & npm --version 2>&1
-        Write-Ok "node $nodeVersion; npm $npmVersion"
-        return
+        try {
+            $nodeVersion = & node --version 2>&1
+            $nodeOk = $LASTEXITCODE -eq 0
+            $npmVersion = & npm --version 2>&1
+            $npmOk = $LASTEXITCODE -eq 0
+            if ($nodeOk -and $npmOk) {
+                Write-Ok "node $nodeVersion；npm $npmVersion"
+                return
+            }
+            Write-WarnLine "Node.js 或 npm 命令存在但不可用：node=$nodeVersion；npm=$npmVersion"
+        } catch {
+            Write-WarnLine "检测 Node.js/npm 失败，将按未安装处理：$($_.Exception.Message)"
+        }
     }
 
-    Write-WarnLine "Node.js/npm was not found. It is needed to install the npm Codex CLI fallback."
-    if (Confirm-Action "Install Node.js LTS with winget now?") {
+    Write-WarnLine "未检测到可用的 Node.js/npm。安装 npm 版 Codex CLI 时需要它。"
+    if (Confirm-Action "是否现在通过 winget 自动安装 Node.js LTS？") {
         Ensure-WingetPackage -PackageId "OpenJS.NodeJS.LTS" -DisplayName "Node.js LTS"
         if (Test-Command "node" -and Test-Command "npm") {
-            Write-Ok "Node.js/npm installed"
+            Write-Ok "Node.js/npm 已安装"
             return
         }
-        throw "Node.js was installed, but this PowerShell session cannot find npm yet. Restart PowerShell and rerun this script."
+        throw "Node.js 已安装，但当前 PowerShell 会话暂时找不到 npm。请重启 PowerShell 后重新运行本脚本。"
     }
-    throw "npm is required when no runnable Codex CLI is available."
+    throw "未找到可运行的 Codex CLI 时，需要 npm 才能继续自动安装。"
 }
 
 function Test-ExecutableVersion {
@@ -265,24 +532,26 @@ function Resolve-CodexCommand {
 }
 
 function Ensure-CodexCli {
-    Write-Step "Checking Codex CLI"
+    Write-Step "检查 Codex CLI"
     $codexCommand = Resolve-CodexCommand
     if ($codexCommand) {
         return $codexCommand
     }
 
-    Write-WarnLine "No runnable Codex CLI was found."
-    Write-WarnLine "If WindowsApps codex.exe returns Access is denied, this script can install the npm CLI instead."
+    Write-WarnLine "未找到可运行的 Codex CLI。"
+    Write-WarnLine "如果 WindowsApps 的 codex.exe 返回 Access is denied，本脚本可以改装 npm 版 Codex CLI。"
     Ensure-NodeAndNpm
-    if (Confirm-Action "Install @openai/codex globally with npm now?") {
-        Invoke-Logged -FilePath "npm" -ArgumentList @("install", "-g", "@openai/codex")
+    if (Confirm-Action "是否现在通过 npm 全局安装 @openai/codex？") {
+        Ensure-InstallProxyPreference
+        $npmArgs = @("install", "-g") + (Get-NpmProxyArgs) + @("@openai/codex")
+        Invoke-Logged -FilePath "npm" -ArgumentList $npmArgs -Activity "正在安装 npm 版 Codex CLI"
         $codexCommand = Resolve-CodexCommand
         if ($codexCommand) {
             return $codexCommand
         }
-        throw "@openai/codex installed, but no runnable codex command was found. Check npm global prefix and PATH."
+        throw "@openai/codex 已安装，但仍未找到可运行的 codex 命令。请检查 npm 全局目录和 PATH。"
     }
-    throw "A runnable Codex CLI is required."
+    throw "需要可运行的 Codex CLI 才能继续。"
 }
 
 function Read-EnvFile {
@@ -364,6 +633,7 @@ function Write-EnvFile {
         "CODEX_CONTEXT_MODE=$(Get-EnvValue -Map $Existing -Key 'CODEX_CONTEXT_MODE' -DefaultValue 'native')",
         "CODEX_ALLOWED_MODELS=$(Get-EnvValue -Map $Existing -Key 'CODEX_ALLOWED_MODELS' -DefaultValue 'gpt-5.5,gpt-5.4')",
         "CODEX_TIMEOUT_SECONDS=$(Get-EnvValue -Map $Existing -Key 'CODEX_TIMEOUT_SECONDS' -DefaultValue '1800')",
+        "RECENT_DEFAULT_COUNT=$(Get-EnvValue -Map $Existing -Key 'RECENT_DEFAULT_COUNT' -DefaultValue '5')",
         "MAX_HISTORY_CHARS=$(Get-EnvValue -Map $Existing -Key 'MAX_HISTORY_CHARS' -DefaultValue '12000')",
         "",
         "# QQ official Gateway mode.",
@@ -380,11 +650,14 @@ function Write-EnvFile {
         "QQ_MAX_REPLY_CHUNKS=$(Get-EnvValue -Map $Existing -Key 'QQ_MAX_REPLY_CHUNKS' -DefaultValue '5')",
         "QQ_JOB_QUEUE_SIZE=$(Get-EnvValue -Map $Existing -Key 'QQ_JOB_QUEUE_SIZE' -DefaultValue '20')",
         "QQ_CODEX_MAX_PARALLEL=$(Get-EnvValue -Map $Existing -Key 'QQ_CODEX_MAX_PARALLEL' -DefaultValue '5')",
-        "QQ_TASK_STATUS_INTERVAL_SECONDS=$(Get-EnvValue -Map $Existing -Key 'QQ_TASK_STATUS_INTERVAL_SECONDS' -DefaultValue '60')",
+        "QQ_TASK_STATUS_INTERVAL_SECONDS=$(Get-EnvValue -Map $Existing -Key 'QQ_TASK_STATUS_INTERVAL_SECONDS' -DefaultValue '300')",
         "QQ_TASK_PARTIAL_INTERVAL_SECONDS=$(Get-EnvValue -Map $Existing -Key 'QQ_TASK_PARTIAL_INTERVAL_SECONDS' -DefaultValue '60')",
         "QQ_TASK_PARTIAL_MAX_CHARS=$(Get-EnvValue -Map $Existing -Key 'QQ_TASK_PARTIAL_MAX_CHARS' -DefaultValue '1200')",
-        "QQ_SEND_PROCESSING_MESSAGE=$(Get-EnvValue -Map $Existing -Key 'QQ_SEND_PROCESSING_MESSAGE' -DefaultValue '1')",
-        "QQ_PROCESSING_TEXT=$(Get-EnvValue -Map $Existing -Key 'QQ_PROCESSING_TEXT' -DefaultValue 'Received, processing.')",
+        "QQ_SEND_PARTIAL_OUTPUTS=$(Get-EnvValue -Map $Existing -Key 'QQ_SEND_PARTIAL_OUTPUTS' -DefaultValue '0')",
+        "QQ_SHOW_TASK_CONTEXT_ON_FINAL=$(Get-EnvValue -Map $Existing -Key 'QQ_SHOW_TASK_CONTEXT_ON_FINAL' -DefaultValue '1')",
+        "QQ_TRUNCATE_LONG_REPLIES=$(Get-EnvValue -Map $Existing -Key 'QQ_TRUNCATE_LONG_REPLIES' -DefaultValue '1')",
+        "QQ_SEND_PROCESSING_MESSAGE=$(Get-EnvValue -Map $Existing -Key 'QQ_SEND_PROCESSING_MESSAGE' -DefaultValue '0')",
+        "QQ_PROCESSING_TEXT=$(Get-EnvValue -Map $Existing -Key 'QQ_PROCESSING_TEXT' -DefaultValue '')",
         "QQ_SEND_STARTUP_TO_ALLOWED_USERS=$(Get-EnvValue -Map $Existing -Key 'QQ_SEND_STARTUP_TO_ALLOWED_USERS' -DefaultValue '1')",
         "QQ_ATTACHMENT_DOWNLOAD=$(Get-EnvValue -Map $Existing -Key 'QQ_ATTACHMENT_DOWNLOAD' -DefaultValue '1')",
         "QQ_ATTACHMENT_MAX_COUNT=$(Get-EnvValue -Map $Existing -Key 'QQ_ATTACHMENT_MAX_COUNT' -DefaultValue '4')",
@@ -412,7 +685,7 @@ function Ensure-EnvConfig {
         [string]$DefaultWorkdir
     )
 
-    Write-Step "Checking bridge configuration"
+    Write-Step "检查桥接器配置"
     $existing = Read-EnvFile -Path $EnvPath
     $appId = Get-EnvValue -Map $existing -Key "QQ_APP_ID" -DefaultValue "replace-with-qq-app-id"
     $appSecret = Get-EnvValue -Map $existing -Key "QQ_APP_SECRET" -DefaultValue "replace-with-qq-app-secret"
@@ -439,16 +712,16 @@ function Ensure-EnvConfig {
     }
 
     if (-not (Test-ConfiguredValue $appId) -or -not (Test-ConfiguredValue $appSecret)) {
-        throw "QQ_APP_ID and QQ_APP_SECRET must be configured before the bridge can connect to QQ Gateway."
+        throw "必须先配置 QQ_APP_ID 和 QQ_APP_SECRET，才能连接 QQ Gateway。"
     }
 
     Write-EnvFile -Path $EnvPath -Existing $existing -CodexCommand $CodexCommand -CodexWorkdir $codexWorkdir -AppId $appId -AppSecret $appSecret
-    Write-Ok "Configuration saved to $EnvPath"
-    Write-Host "Configured summary:"
+    Write-Ok "配置已保存到 $EnvPath"
+    Write-Host "当前配置摘要："
     Write-Host "  CODEX_COMMAND=$CodexCommand"
     Write-Host "  CODEX_WORKDIR=$codexWorkdir"
     Write-Host "  QQ_APP_ID=$appId"
-    Write-Host "  QQ_APP_SECRET=(hidden)"
+    Write-Host "  QQ_APP_SECRET=(已隐藏)"
 }
 
 function Read-DeployPreferences {
@@ -464,7 +737,7 @@ function Read-DeployPreferences {
         }
         return $map
     } catch {
-        Write-WarnLine "Could not read deploy preferences; ignoring: $Path"
+        Write-WarnLine "无法读取部署偏好，将忽略：$Path"
         return @{}
     }
 }
@@ -513,7 +786,7 @@ function Test-AutostartTaskConfigured {
         $enabledTriggers = @($task.Triggers | Where-Object { $_.Enabled -ne $false })
         return $enabledTriggers.Count -gt 0
     } catch {
-        Write-WarnLine "Could not verify autostart task; will ask again: $($_.Exception.Message)"
+        Write-WarnLine "无法验证自启动任务，将继续询问：$($_.Exception.Message)"
         return $false
     }
 }
@@ -524,10 +797,10 @@ function Ensure-AutostartTask {
         [string]$AutostartScript
     )
     if (-not (Test-Path -LiteralPath $AutostartScript)) {
-        throw "Cannot find autostart script: $AutostartScript"
+        throw "找不到自启动脚本：$AutostartScript"
     }
 
-    Write-Step "Configuring Windows autostart"
+    Write-Step "配置 Windows 登录自启动"
     $powershellPath = Join-Path $PSHOME "powershell.exe"
     if (-not (Test-Path -LiteralPath $powershellPath)) {
         $powershellPath = "powershell.exe"
@@ -548,11 +821,11 @@ function Ensure-AutostartTask {
         -Action $action `
         -Trigger $trigger `
         -Settings $settings `
-        -Description "Start Codex Remote Bridge at user logon." `
+        -Description "用户登录时启动 Codex Remote Bridge。" `
         -Force | Out-Null
 
-    Write-Ok "Autostart task configured: $TaskName"
-    Write-Host "  Script: $AutostartScript"
+    Write-Ok "自启动任务已配置：$TaskName"
+    Write-Host "  脚本：$AutostartScript"
 }
 
 function Maybe-ConfigureAutostart {
@@ -562,13 +835,13 @@ function Maybe-ConfigureAutostart {
     )
     $taskName = "CodexRemoteBridge"
     if (Test-AutostartTaskConfigured -TaskName $taskName -AutostartScript $AutostartScript) {
-        Write-Ok "Autostart task is already enabled for this project; skipping autostart prompt."
+        Write-Ok "已检测到本项目的自启动任务处于启用状态，跳过自启动询问。"
         return
     }
 
     $preferences = Read-DeployPreferences -Path $PreferencesPath
     if ([string]$preferences["autostart_prompt"] -eq "never") {
-        Write-Ok "Autostart prompt skipped because you previously chose never."
+        Write-Ok "你之前选择过 never，本次跳过自启动询问。"
         return
     }
 
@@ -576,11 +849,11 @@ function Maybe-ConfigureAutostart {
     if ($choice -eq "never") {
         $preferences["autostart_prompt"] = "never"
         Write-DeployPreferences -Path $PreferencesPath -Preferences $preferences
-        Write-Ok "Saved preference: do not ask about autostart again."
+        Write-Ok "已保存偏好：以后不再询问自启动。"
         return
     }
     if ($choice -eq "no") {
-        Write-Host "This run will not configure autostart. The script will ask again next time."
+        Write-Host "本次不配置自启动。下次运行脚本仍会再次询问。"
         return
     }
 
@@ -614,10 +887,16 @@ function Show-QuickStartHelp {
     Write-Host "  /whoami                       显示当前 QQ Gateway openid"
     Write-Host "  /model                        显示当前模型和思考强度"
     Write-Host "  /model gpt-5.5 high           设置模型和思考强度"
+    Write-Host "  /setup                        显示设置面板"
     Write-Host "  /permission                   显示权限模式"
     Write-Host "  /timeout 45                   设置单次 Codex 调用超时为 45 分钟"
+    Write-Host "  /heartbeat 5                  设置任务运行提醒频率为 5 分钟"
+    Write-Host "  /truncate on/off              开关长内容截断"
+    Write-Host "  /recent-default 10            设置最近对话默认展示 10 条"
     Write-Host "  /permission read only         使用只读模式"
-    Write-Host "  /permission ask               高风险操作前请求批准"
+    Write-Host "  /permission ask               请求批准"
+    Write-Host "  /permission auto              替我审批"
+    Write-Host "  /permission full              完全访问权限"
     Write-Host "  /pending                      显示待批准操作"
     Write-Host "  /allow <id>                   批准待执行操作"
     Write-Host "  /cancel                       取消当前 Codex 任务"
@@ -724,8 +1003,8 @@ function Start-BridgeForeground {
         [string]$ClientDir
     )
     Resolve-ForegroundProcessConflict -ClientDir $ClientDir
-    Write-Step "Starting QQ Gateway bridge in foreground"
-    Write-Host "Press Ctrl+C to stop."
+    Write-Step "以前台模式启动 QQ Gateway"
+    Write-Host "保持此窗口打开；按 Ctrl+C 停止。"
     Invoke-Python -PythonCommand $PythonCommand -Arguments @(".\qq_gateway_client.py") -WorkingDirectory $ClientDir | Out-Null
 }
 
@@ -735,24 +1014,24 @@ function Start-BridgeBackground {
         [string]$ClientDir,
         [string]$LogFile
     )
-    Write-Step "Starting QQ Gateway bridge in background"
+    Write-Step "以后台模式启动 QQ Gateway"
     $exe = $PythonCommand[0]
     $args = @(Get-TailArgs -Command $PythonCommand)
     $args += @("-B", (Join-Path $ClientDir "qq_gateway_background.py"))
     Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $ClientDir -WindowStyle Hidden | Out-Null
     Start-Sleep -Seconds 3
-    Write-Ok "Background supervisor started"
+    Write-Ok "后台守护进程已启动"
     if (Test-Path -LiteralPath $LogFile) {
         Write-Host ""
-        Write-Host "Recent log: $LogFile" -ForegroundColor Cyan
+        Write-Host "最近日志：$LogFile" -ForegroundColor Cyan
         Get-Content -LiteralPath $LogFile -Tail 80 -Encoding UTF8
     } else {
-        Write-WarnLine "Log file has not been created yet: $LogFile"
+        Write-WarnLine "日志文件尚未创建：$LogFile"
     }
 }
 
 if (-not $IsWindows -and $PSVersionTable.PSEdition -eq "Core") {
-    throw "This script is for Windows only."
+    throw "此脚本仅适用于 Windows。"
 }
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -764,7 +1043,7 @@ $preferencesPath = Join-Path $dataDir "deploy-preferences.json"
 $autostartScript = Join-Path $clientDir "start-bridge-autostart.ps1"
 
 if (-not (Test-Path -LiteralPath $clientDir)) {
-    throw "Cannot find client directory: $clientDir"
+    throw "找不到 client 目录：$clientDir"
 }
 
 if ([string]::IsNullOrWhiteSpace($WorkDir)) {
@@ -773,25 +1052,38 @@ if ([string]::IsNullOrWhiteSpace($WorkDir)) {
 
 New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 
-Write-Host "Codex Remote Bridge Windows deploy script" -ForegroundColor Cyan
-Write-Host "Project: $root"
+Write-Host "Codex Remote Bridge Windows 一键部署脚本" -ForegroundColor Cyan
+Write-Host "项目目录：$root"
 
 $python = @(Ensure-Python)
 Ensure-WebsocketClient -PythonCommand $python
 $codexCommand = Ensure-CodexCli
 Ensure-EnvConfig -EnvPath $envPath -CodexCommand $codexCommand -DefaultWorkdir $WorkDir
 
-Write-Step "Validating Python files and local commands"
-Invoke-Python -PythonCommand $python -Arguments @("-m", "py_compile", "codex_bridge_client.py", "qq_gateway_client.py", "qq_gateway_background.py") -WorkingDirectory $clientDir | Out-Null
-Invoke-Python -PythonCommand $python -Arguments @("-c", "from codex_bridge_client import handle_bridge_command; print(handle_bridge_command('/status'))") -WorkingDirectory $clientDir | Out-Null
-Write-Ok "Local validation passed"
+Write-Step "验证 Python 文件和本地命令"
+$compileCheck = Invoke-PythonCapture -PythonCommand $python -Arguments @("-m", "py_compile", "codex_bridge_client.py", "qq_gateway_client.py", "qq_gateway_background.py") -WorkingDirectory $clientDir
+if ($compileCheck.ExitCode -ne 0) {
+    if ($compileCheck.Output) {
+        Write-Host $compileCheck.Output -ForegroundColor Red
+    }
+    throw "Python 文件编译检查失败，请查看上方错误。"
+}
+$commandCheckCode = "from codex_bridge_client import handle_bridge_command; result = handle_bridge_command('/help'); assert isinstance(result, str) and '/help' in result"
+$commandCheck = Invoke-PythonCapture -PythonCommand $python -Arguments @("-c", $commandCheckCode) -WorkingDirectory $clientDir
+if ($commandCheck.ExitCode -ne 0) {
+    if ($commandCheck.Output) {
+        Write-Host $commandCheck.Output -ForegroundColor Red
+    }
+    throw "本地命令处理检查失败，请查看上方错误。"
+}
+Write-Ok "本地验证通过"
 
 if ($CheckOnly) {
-    Write-Step "Check only mode"
-    Write-Host "Configuration and local validation are complete."
-    Write-Host "Run foreground:"
+    Write-Step "仅检查模式"
+    Write-Host "配置和本地验证已完成。"
+    Write-Host "前台运行："
     Write-Host "  powershell -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`""
-    Write-Host "Run background:"
+    Write-Host "后台运行："
     Write-Host "  powershell -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`" -Background"
     exit 0
 }
