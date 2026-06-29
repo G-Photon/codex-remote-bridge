@@ -87,7 +87,7 @@ https://q.qq.com/#/
 ```powershell
 git clone https://github.com/G-Photon/codex-remote-bridge.git
 cd codex-remote-bridge
-powershell -ExecutionPolicy Bypass -File .\client\build-tray-exe.ps1
+powershell -ExecutionPolicy Bypass -File .\build-tray-exe.ps1
 ```
 
 构建完成后会在项目根目录生成：
@@ -114,12 +114,6 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -CheckOnly
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Background
-```
-
-如果不想编译 EXE，也可以使用 PowerShell 版托盘脚本：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\client\start-bridge-tray.ps1
 ```
 
 自动安装依赖前，脚本会检查环境变量、Windows 代理、git/npm 代理和 WinHTTP 代理。如果检测到代理，会询问是否用于下载安装；如果没有检测到，也可以手动输入代理地址。
@@ -397,7 +391,7 @@ If you want to build the tray EXE from source, clone the repository and run:
 ```powershell
 git clone https://github.com/G-Photon/codex-remote-bridge.git
 cd codex-remote-bridge
-powershell -ExecutionPolicy Bypass -File .\client\build-tray-exe.ps1
+powershell -ExecutionPolicy Bypass -File .\build-tray-exe.ps1
 ```
 
 The output is written to the project root:
@@ -424,12 +418,6 @@ Background mode without a tray icon:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Background
-```
-
-If you do not want to build the EXE, a PowerShell tray script is available as a fallback:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\client\start-bridge-tray.ps1
 ```
 
 Before installing dependencies, the script checks environment variables, Windows proxy settings, git/npm proxy settings, and WinHTTP proxy settings. If a proxy is found, it asks whether to use it for downloads. If no proxy is detected, you can still enter one manually.

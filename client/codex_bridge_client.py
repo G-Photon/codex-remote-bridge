@@ -67,7 +67,9 @@ def load_dotenv(path: Path) -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        key = key.strip().lstrip("\ufeff")
+        if key:
+            os.environ[key] = value.strip().strip('"').strip("'")
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -194,10 +196,62 @@ def sort_key_updated_at(item: Dict[str, Any]) -> tuple[int, str]:
     return (raw_int, str(item.get("updated_at", "")))
 
 
+def merged_windows_path() -> str:
+    if os.name != "nt":
+        return os.environ.get("PATH", "")
+    try:
+        import winreg
+
+        parts: List[str] = []
+        for root, subkey in (
+            (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+            (winreg.HKEY_CURRENT_USER, r"Environment"),
+        ):
+            try:
+                with winreg.OpenKey(root, subkey) as key:
+                    value, _ = winreg.QueryValueEx(key, "Path")
+                    expanded = os.path.expandvars(str(value))
+                    if expanded:
+                        parts.extend(expanded.split(os.pathsep))
+            except OSError:
+                pass
+        parts.extend(os.environ.get("PATH", "").split(os.pathsep))
+        seen = set()
+        merged = []
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            dedupe_key = part.lower()
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            merged.append(part)
+        return os.pathsep.join(merged)
+    except Exception:
+        return os.environ.get("PATH", "")
+
+
 def codex_command_path() -> str:
-    if os.name == "nt" and CODEX_COMMAND.lower() == "codex":
-        return shutil.which("codex.cmd") or shutil.which("codex.exe") or CODEX_COMMAND
-    return CODEX_COMMAND
+    if os.name != "nt":
+        return CODEX_COMMAND
+
+    command = CODEX_COMMAND.strip() or "codex"
+    if command.lower() in {"codex", "codex.cmd"}:
+        appdata = os.environ.get("APPDATA", "")
+        appdata_codex = Path(appdata) / "npm" / "codex.cmd" if appdata else None
+        if appdata_codex and appdata_codex.exists():
+            return str(appdata_codex)
+        return shutil.which("codex.cmd", path=merged_windows_path()) or command
+    return command
+
+
+def codex_subprocess_env() -> Dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    if os.name == "nt":
+        env["PATH"] = merged_windows_path()
+    return env
 
 
 def new_local_session_id() -> str:
@@ -1760,6 +1814,7 @@ def run_codex_process(
             encoding="utf-8",
             errors="replace",
             creationflags=creationflags,
+            env=codex_subprocess_env(),
         )
         with current_codex_lock:
             current_codex_proc = proc
@@ -2272,6 +2327,7 @@ def delete_command(args: str) -> str:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=60,
+            env=codex_subprocess_env(),
         )
         if proc.returncode != 0:
             return "归档失败：\n" + proc.stdout.strip()

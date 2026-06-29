@@ -795,7 +795,7 @@ function Ensure-AutostartTask {
 
     $action = New-ScheduledTaskAction `
         -Execute $powershellPath `
-        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$AutostartScript`""
+        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$AutostartScript`" -Background"
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
@@ -1027,7 +1027,7 @@ $envPath = Join-Path $clientDir ".env"
 $dataDir = Join-Path $clientDir "data"
 $logFile = Join-Path $dataDir "qq-gateway-autostart.log"
 $preferencesPath = Join-Path $dataDir "deploy-preferences.json"
-$autostartScript = Join-Path $clientDir "start-bridge-autostart.ps1"
+$autostartScript = $MyInvocation.MyCommand.Path
 
 if (-not (Test-Path -LiteralPath $clientDir)) {
     throw "找不到 client 目录：$clientDir"
