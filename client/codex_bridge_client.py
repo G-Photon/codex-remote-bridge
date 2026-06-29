@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import uuid
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -79,7 +80,6 @@ def env_bool(name: str, default: bool) -> bool:
 load_dotenv(BASE_DIR / ".env")
 
 CODEX_COMMAND = os.getenv("CODEX_COMMAND", "codex")
-CODEX_WORKDIR = os.getenv("CODEX_WORKDIR", str(Path.cwd()))
 CODEX_MODEL = os.getenv("CODEX_MODEL", "gpt-5.5").strip() or "gpt-5.5"
 CODEX_REASONING_EFFORT = os.getenv("CODEX_REASONING_EFFORT", "xhigh").strip() or "xhigh"
 CODEX_PERMISSION = os.getenv("CODEX_PERMISSION", "read-only").strip() or "read-only"
@@ -102,6 +102,9 @@ current_codex_proc: Optional[subprocess.Popen] = None
 current_codex_job = ""
 current_codex_tasks: Dict[str, subprocess.Popen] = {}
 approved_run = threading.local()
+NO_PROJECT_GROUP_CWD = "__codex_conversations__"
+NO_PROJECT_GROUP_LABEL = "对话"
+CODEX_CONVERSATIONS_DIR = Path.home() / "Documents" / "Codex"
 
 
 def clamp_int(value: int, minimum: int, maximum: int) -> int:
@@ -147,15 +150,32 @@ def now_iso() -> str:
 
 
 def unix_time_to_iso(value: Any) -> str:
+    return local_time_text(value)
+
+
+def local_time_text(value: Any, compact: bool = False) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    fmt = "%m-%d %H:%M" if compact else "%Y-%m-%d %H:%M:%S"
     try:
-        seconds = float(value)
+        if re.fullmatch(r"\d+(?:\.\d+)?", text):
+            seconds = float(text)
+            if seconds > 10_000_000_000:
+                seconds /= 1000
+            if seconds > 0:
+                return datetime.fromtimestamp(seconds).strftime(fmt)
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone()
+        return parsed.strftime(fmt)
     except Exception:
-        return ""
-    if seconds <= 0:
-        return ""
-    if seconds > 10_000_000_000:
-        seconds /= 1000
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(seconds))
+        fallback = text.replace("T", " ").replace("Z", "").split(".")[0]
+        if compact:
+            match = re.search(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})", fallback)
+            if match:
+                return f"{match.group(2)}-{match.group(3)} {match.group(4)}:{match.group(5)}"
+        return fallback
 
 
 def normalize_cwd(value: Any) -> str:
@@ -428,6 +448,87 @@ def current_process_runtime() -> Dict[str, Any]:
     return runtime
 
 
+def normalize_path_for_compare(value: str) -> str:
+    text = normalize_cwd(value)
+    if not text:
+        return ""
+    try:
+        text = str(Path(text).resolve())
+    except Exception:
+        text = str(Path(text))
+    return os.path.normcase(os.path.normpath(text))
+
+
+def is_no_project_cwd(cwd: str) -> bool:
+    normalized = normalize_path_for_compare(cwd)
+    if not normalized:
+        return True
+    root = normalize_path_for_compare(str(CODEX_CONVERSATIONS_DIR))
+    if not root:
+        return False
+    try:
+        return os.path.commonpath([normalized, root]) == root
+    except ValueError:
+        return False
+
+
+def native_session_cwd(session_id: str) -> str:
+    session_id = (session_id or "").strip()
+    if not session_id:
+        return ""
+    try:
+        item = find_native_session(session_id)
+    except Exception:
+        item = None
+    if not item:
+        return ""
+    return normalize_cwd(item.get("cwd", ""))
+
+
+def default_process_cwd() -> str:
+    return str(Path.cwd())
+
+
+def runtime_for_job(job: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if job and isinstance(job.get("_runtime"), dict):
+        runtime = dict(job["_runtime"])
+        permission = normalize_permission(str(runtime.get("permission", CODEX_PERMISSION)))
+        force_permission = str(getattr(approved_run, "force_permission", "") or "")
+        try:
+            force_permission = normalize_permission(force_permission) if force_permission else ""
+        except ValueError:
+            force_permission = ""
+        if force_permission in PERMISSION_PROFILES:
+            permission = force_permission
+        runtime["permission"] = permission
+        runtime["permission_profile"] = PERMISSION_PROFILES[permission]
+        runtime["context_mode"] = normalize_context_mode(str(runtime.get("context_mode", CODEX_CONTEXT_MODE)))
+        runtime["reasoning_effort"] = normalize_reasoning(str(runtime.get("reasoning_effort", CODEX_REASONING_EFFORT)))
+        runtime["workdir"] = normalize_cwd(runtime.get("workdir", "")) or default_process_cwd()
+        runtime["timeout_seconds"] = int(runtime.get("timeout_seconds", CODEX_TIMEOUT_SECONDS) or CODEX_TIMEOUT_SECONDS)
+        runtime["recent_default_count"] = clamp_int(int(runtime.get("recent_default_count", RECENT_DEFAULT_COUNT) or RECENT_DEFAULT_COUNT), 1, 20)
+        runtime["task_status_interval_seconds"] = clamp_int(int(runtime.get("task_status_interval_seconds", TASK_STATUS_INTERVAL_SECONDS) or 0), 0, 86400)
+        runtime["truncate_long_replies"] = bool(runtime.get("truncate_long_replies", TRUNCATE_LONG_REPLIES))
+        return runtime
+
+    runtime = dict(current_process_runtime())
+    if runtime["context_mode"] == "native":
+        runtime["workdir"] = native_session_cwd(runtime["active_native_session_id"]) or default_process_cwd()
+    else:
+        runtime["workdir"] = default_process_cwd()
+    return runtime
+
+
+def freeze_job_runtime(job: Dict[str, Any]) -> Dict[str, Any]:
+    runtime = runtime_for_job(job)
+    job["_runtime"] = dict(runtime)
+    job["_context_mode"] = runtime["context_mode"]
+    job["_active_session_id"] = runtime["active_session_id"]
+    job["_active_native_session_id"] = runtime["active_native_session_id"]
+    job["_workdir"] = runtime["workdir"]
+    return runtime
+
+
 def command_head(text: str) -> str:
     text = (text or "").strip()
     if not text.startswith("/"):
@@ -438,6 +539,7 @@ def command_head(text: str) -> str:
 def is_bridge_command_text(text: str) -> bool:
     return command_head(text) in {
         "/start",
+        "/s",
         "/help",
         "/status",
         "/whoami",
@@ -535,7 +637,7 @@ def create_pending_approval(job: Dict[str, Any]) -> str:
     item_id = approval_id()
     user_text = str(job.get("text", ""))
     plan = build_approval_plan(user_text, job).replace("{id}", item_id)
-    runtime = current_runtime()
+    runtime = freeze_job_runtime(job)
     item = {
         "id": item_id,
         "created_at": now_iso(),
@@ -549,6 +651,8 @@ def create_pending_approval(job: Dict[str, Any]) -> str:
         "local_session_id": runtime["active_session_id"],
         "model": runtime["model"],
         "reasoning_effort": runtime["reasoning_effort"],
+        "permission": runtime["permission"],
+        "workdir": runtime["workdir"],
         "status": "pending",
     }
     data = load_pending_approvals()
@@ -697,17 +801,20 @@ def run_approved_pending_approval(item: Dict[str, Any]) -> str:
         raise RuntimeError("pending approval has no stored job")
     job["text"] = user_text
 
-    state = load_state()
-    context_mode = normalize_context_mode(str(item.get("context_mode", state.get("context_mode", CODEX_CONTEXT_MODE))))
-    if context_mode == "native":
-        state["context_mode"] = "native"
-        state["active_native_session_id"] = str(item.get("native_session_id", state.get("active_native_session_id", "")))
-    else:
-        local_id = str(item.get("local_session_id", state.get("active_session_id", "")))
-        if local_id in state.get("sessions", {}):
-            state["context_mode"] = "prompt"
-            state["active_session_id"] = local_id
-    save_state(state)
+    runtime = runtime_for_job(job)
+    runtime["context_mode"] = normalize_context_mode(str(item.get("context_mode", runtime["context_mode"])))
+    runtime["active_native_session_id"] = str(item.get("native_session_id", runtime["active_native_session_id"]))
+    runtime["active_session_id"] = str(item.get("local_session_id", runtime["active_session_id"]))
+    runtime["model"] = str(item.get("model", runtime["model"]))
+    runtime["reasoning_effort"] = normalize_reasoning(str(item.get("reasoning_effort", runtime["reasoning_effort"])))
+    runtime["permission"] = normalize_permission(str(item.get("permission", runtime["permission"])))
+    runtime["permission_profile"] = PERMISSION_PROFILES[runtime["permission"]]
+    runtime["workdir"] = normalize_cwd(item.get("workdir", runtime.get("workdir", ""))) or runtime["workdir"]
+    job["_runtime"] = runtime
+    job["_context_mode"] = runtime["context_mode"]
+    job["_active_native_session_id"] = runtime["active_native_session_id"]
+    job["_active_session_id"] = runtime["active_session_id"]
+    job["_workdir"] = runtime["workdir"]
 
     old_enabled = getattr(approved_run, "enabled", False)
     old_force_permission = getattr(approved_run, "force_permission", "")
@@ -743,10 +850,7 @@ def current_runtime() -> Dict[str, Any]:
 
 
 def job_session_key(job: Dict[str, Any]) -> str:
-    runtime = current_process_runtime()
-    job.setdefault("_context_mode", runtime["context_mode"])
-    job.setdefault("_active_session_id", runtime["active_session_id"])
-    job.setdefault("_active_native_session_id", runtime["active_native_session_id"])
+    runtime = freeze_job_runtime(job)
     if runtime["context_mode"] == "native":
         return "native:" + (runtime["active_native_session_id"] or "new")
     return "local:" + runtime["active_session_id"]
@@ -955,9 +1059,7 @@ def _extract_native_user_text(line: str) -> str:
 
 def _event_timestamp_text(event: Dict[str, Any]) -> str:
     raw = str(event.get("timestamp") or event.get("created_at") or event.get("time") or "").strip()
-    if not raw:
-        return ""
-    return raw.replace("T", " ").replace("Z", "").split(".")[0]
+    return local_time_text(raw)
 
 
 def _extract_native_conversation_message(line: str) -> Optional[Dict[str, str]]:
@@ -1156,6 +1258,8 @@ def session_title(item: Dict[str, Any], fallback_id: str) -> str:
 
 def native_session_group_label(cwd: str) -> str:
     cwd = re.sub(r"\s+", " ", (cwd or "").strip())
+    if cwd == NO_PROJECT_GROUP_CWD:
+        return NO_PROJECT_GROUP_LABEL
     if not cwd:
         return "(未记录目录)"
     name = Path(cwd).name or cwd
@@ -1174,12 +1278,8 @@ def resolve_native_session_group_token(token: str, limit: int = 10000) -> str:
         return ""
 
     matches: List[str] = []
-    seen: set[str] = set()
-    for item in list_native_sessions(limit=limit, include_unlisted=True):
+    for item in native_session_groups(limit=limit):
         cwd = str(item.get("cwd") or "").strip()
-        if cwd in seen:
-            continue
-        seen.add(cwd)
         if native_session_group_token(cwd).startswith(token):
             matches.append(cwd)
     return matches[0] if len(matches) == 1 else ""
@@ -1203,7 +1303,8 @@ def resolve_native_session_id(query: str, limit: int = 10000) -> str:
 def native_session_groups(limit: int = 200) -> List[Dict[str, Any]]:
     groups: Dict[str, Dict[str, Any]] = {}
     for item in list_native_sessions(limit=limit):
-        cwd = str(item.get("cwd") or "").strip()
+        item_cwd = normalize_cwd(item.get("cwd", ""))
+        cwd = NO_PROJECT_GROUP_CWD if is_no_project_cwd(item_cwd) else item_cwd
         group = groups.setdefault(
             cwd,
             {
@@ -1215,7 +1316,10 @@ def native_session_groups(limit: int = 200) -> List[Dict[str, Any]]:
                 "latest_title": "",
             },
         )
-        group["items"].append(item)
+        grouped_item = dict(item)
+        grouped_item["group_cwd"] = cwd
+        grouped_item["raw_cwd"] = item_cwd
+        group["items"].append(grouped_item)
         group["count"] += 1
         updated_raw = int(item.get("updated_at_raw") or 0)
         if updated_raw > int(group.get("updated_at_raw") or 0):
@@ -1228,7 +1332,14 @@ def native_session_groups(limit: int = 200) -> List[Dict[str, Any]]:
         if group["items"]:
             latest = group["items"][0]
             group["latest_title"] = session_title(latest, str(latest.get("id", "")))
-    grouped.sort(key=lambda item: (int(item.get("updated_at_raw") or 0), str(item.get("updated_at", ""))), reverse=True)
+    grouped.sort(
+        key=lambda item: (
+            1 if str(item.get("cwd", "")) == NO_PROJECT_GROUP_CWD else 0,
+            int(item.get("updated_at_raw") or 0),
+            str(item.get("updated_at", "")),
+        ),
+        reverse=True,
+    )
     return grouped
 
 
@@ -1552,7 +1663,7 @@ def codex_base_cmd(runtime: Dict[str, Any], output_file: Path) -> List[str]:
         "--json",
         "--skip-git-repo-check",
         "--cd",
-        CODEX_WORKDIR,
+        str(runtime.get("workdir") or default_process_cwd()),
         "--output-last-message",
         str(output_file),
     ]
@@ -1623,9 +1734,11 @@ def run_codex_process(
     session_id: str = "",
     job_id: str = "",
     on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+    runtime: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, str]:
     global current_codex_proc, current_codex_job
-    runtime = current_process_runtime()
+    runtime = dict(runtime or current_process_runtime())
+    runtime["workdir"] = normalize_cwd(runtime.get("workdir", "")) or default_process_cwd()
     with tempfile.TemporaryDirectory(prefix="codex-bridge-") as tmp:
         output_file = Path(tmp) / "last-message.txt"
         cmd = codex_base_cmd(runtime, output_file)
@@ -1795,7 +1908,7 @@ def session_list_text(args: str = "") -> str:
                 title = session_title(item, item_id)
                 short_id = item_id[-8:] if item_id else ""
                 lines.append(
-                    f"- {offset}. {title} | {item.get('updated_at', '')} | id:{short_id} | {item_id}"
+                    f"- {offset}. {title} | {local_time_text(item.get('updated_at', ''))} | id:{short_id} | {item_id}"
                 )
             if not current:
                 lines.append("(这个目录下没有会话)")
@@ -1817,7 +1930,7 @@ def session_list_text(args: str = "") -> str:
             label = str(group.get("label", cwd))
             count = int(group.get("count", 0))
             latest_title = str(group.get("latest_title", "")).strip()
-            latest = str(group.get("updated_at", "")).strip()
+            latest = local_time_text(group.get("updated_at", ""))
             if latest_title:
                 lines.append(f"- {offset}. {label} | {count} 会话 | {latest} | 最新: {latest_title}")
             else:
@@ -1837,7 +1950,7 @@ def session_list_text(args: str = "") -> str:
     for item in sessions:
         mark = "*" if item["id"] == active else "-"
         lines.append(
-            f"{mark} {item['id']} | {item.get('updated_at', '')} | "
+            f"{mark} {item['id']} | {local_time_text(item.get('updated_at', ''))} | "
             f"{item.get('message_count', 0)} 条 | {item.get('title', '未命名')}"
         )
     return "\n".join(lines)
@@ -1878,6 +1991,7 @@ def help_text() -> str:
     return "\n".join([
         "可用指令：",
         "/start - 显示入口面板、当前模型和快捷按钮",
+        "/s - /start 的简写",
         "/help - 展示所有指令",
         "/status - 显示 Gateway、模型、思考强度、历史长度、权限",
         "/whoami - 显示当前 QQ Gateway openid，用于配置 allowlist",
@@ -2199,7 +2313,7 @@ def handle_bridge_command(text: str, job: Optional[Dict[str, Any]] = None) -> Op
     command = command.lower().strip()
     args = args.strip()
 
-    if command == "/start":
+    if command in {"/start", "/s"}:
         return start_text()
     if command == "/help":
         return help_text()
@@ -2255,7 +2369,7 @@ def handle_bridge_command(text: str, job: Optional[Dict[str, Any]] = None) -> Op
 def run_codex_prompt_mode(job: Dict[str, Any], on_event: Optional[Callable[[Dict[str, Any]], None]] = None) -> str:
     remote_text = job.get("text", "")
     attachments_text = str(job.get("attachments_text", "")).strip()
-    runtime = current_process_runtime()
+    runtime = runtime_for_job(job)
     active_session_id = str(job.get("_active_session_id") or runtime["active_session_id"])
     history = read_history_tail(active_session_id)
     profile = runtime["permission_profile"]
@@ -2277,12 +2391,12 @@ def run_codex_prompt_mode(job: Dict[str, Any], on_event: Optional[Callable[[Dict
 {remote_text}
 {attachments_text}
 """
-    return run_codex_process(prompt, "", str(job.get("id", "")), on_event=on_event).get("text", "")
+    return run_codex_process(prompt, "", str(job.get("id", "")), on_event=on_event, runtime=runtime).get("text", "")
 
 
 def run_codex_native_mode(job: Dict[str, Any], on_event: Optional[Callable[[Dict[str, Any]], None]] = None) -> str:
-    state = load_state()
-    session_id = str(job.get("_active_native_session_id") or state.get("active_native_session_id", ""))
+    runtime = runtime_for_job(job)
+    session_id = str(job.get("_active_native_session_id") or runtime["active_native_session_id"])
     remote_text = job.get("text", "")
     attachments_text = str(job.get("attachments_text", "")).strip()
     prompt = f"""你正在通过 QQ 远程消息桥接和用户对话。
@@ -2297,7 +2411,7 @@ def run_codex_native_mode(job: Dict[str, Any], on_event: Optional[Callable[[Dict
 {remote_text}
 {attachments_text}
 """
-    result = run_codex_process(prompt, session_id, str(job.get("id", "")), on_event=on_event)
+    result = run_codex_process(prompt, session_id, str(job.get("id", "")), on_event=on_event, runtime=runtime)
     thread_id = result.get("thread_id", "")
     if thread_id:
         state = load_state()
@@ -2308,6 +2422,6 @@ def run_codex_native_mode(job: Dict[str, Any], on_event: Optional[Callable[[Dict
 
 
 def run_codex(job: Dict[str, Any], on_event: Optional[Callable[[Dict[str, Any]], None]] = None) -> str:
-    if current_process_runtime()["context_mode"] == "native":
+    if runtime_for_job(job)["context_mode"] == "native":
         return run_codex_native_mode(job, on_event=on_event)
     return run_codex_prompt_mode(job, on_event=on_event)

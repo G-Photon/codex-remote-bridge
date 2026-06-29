@@ -1,8 +1,7 @@
 ﻿param(
     [switch]$Reconfigure,
     [switch]$Background,
-    [switch]$CheckOnly,
-    [string]$WorkDir = ""
+    [switch]$CheckOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -619,14 +618,12 @@ function Write-EnvFile {
         [string]$Path,
         [hashtable]$Existing,
         [string]$CodexCommand,
-        [string]$CodexWorkdir,
         [string]$AppId,
         [string]$AppSecret
     )
 
     $lines = @(
         "CODEX_COMMAND=$CodexCommand",
-        "CODEX_WORKDIR=$CodexWorkdir",
         "CODEX_MODEL=$(Get-EnvValue -Map $Existing -Key 'CODEX_MODEL' -DefaultValue 'gpt-5.5')",
         "CODEX_REASONING_EFFORT=$(Get-EnvValue -Map $Existing -Key 'CODEX_REASONING_EFFORT' -DefaultValue 'xhigh')",
         "CODEX_PERMISSION=$(Get-EnvValue -Map $Existing -Key 'CODEX_PERMISSION' -DefaultValue 'read-only')",
@@ -681,15 +678,13 @@ function Write-EnvFile {
 function Ensure-EnvConfig {
     param(
         [string]$EnvPath,
-        [string]$CodexCommand,
-        [string]$DefaultWorkdir
+        [string]$CodexCommand
     )
 
     Write-Step "检查桥接器配置"
     $existing = Read-EnvFile -Path $EnvPath
     $appId = Get-EnvValue -Map $existing -Key "QQ_APP_ID" -DefaultValue "replace-with-qq-app-id"
     $appSecret = Get-EnvValue -Map $existing -Key "QQ_APP_SECRET" -DefaultValue "replace-with-qq-app-secret"
-    $codexWorkdir = Get-EnvValue -Map $existing -Key "CODEX_WORKDIR" -DefaultValue $DefaultWorkdir
 
     $needsCredentials = $Reconfigure -or -not (Test-ConfiguredValue $appId) -or -not (Test-ConfiguredValue $appSecret)
     if ($needsCredentials) {
@@ -704,22 +699,14 @@ function Ensure-EnvConfig {
         }
     }
 
-    if ($Reconfigure -or -not (Test-ConfiguredValue $codexWorkdir)) {
-        $answer = Read-Host "Codex 工作目录 [$codexWorkdir]"
-        if (-not [string]::IsNullOrWhiteSpace($answer)) {
-            $codexWorkdir = $answer.Trim()
-        }
-    }
-
     if (-not (Test-ConfiguredValue $appId) -or -not (Test-ConfiguredValue $appSecret)) {
         throw "必须先配置 QQ_APP_ID 和 QQ_APP_SECRET，才能连接 QQ Gateway。"
     }
 
-    Write-EnvFile -Path $EnvPath -Existing $existing -CodexCommand $CodexCommand -CodexWorkdir $codexWorkdir -AppId $appId -AppSecret $appSecret
+    Write-EnvFile -Path $EnvPath -Existing $existing -CodexCommand $CodexCommand -AppId $appId -AppSecret $appSecret
     Write-Ok "配置已保存到 $EnvPath"
     Write-Host "当前配置摘要："
     Write-Host "  CODEX_COMMAND=$CodexCommand"
-    Write-Host "  CODEX_WORKDIR=$codexWorkdir"
     Write-Host "  QQ_APP_ID=$appId"
     Write-Host "  QQ_APP_SECRET=(已隐藏)"
 }
@@ -1046,10 +1033,6 @@ if (-not (Test-Path -LiteralPath $clientDir)) {
     throw "找不到 client 目录：$clientDir"
 }
 
-if ([string]::IsNullOrWhiteSpace($WorkDir)) {
-    $WorkDir = $root
-}
-
 New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 
 Write-Host "Codex Remote Bridge Windows 一键部署脚本" -ForegroundColor Cyan
@@ -1058,7 +1041,7 @@ Write-Host "项目目录：$root"
 $python = @(Ensure-Python)
 Ensure-WebsocketClient -PythonCommand $python
 $codexCommand = Ensure-CodexCli
-Ensure-EnvConfig -EnvPath $envPath -CodexCommand $codexCommand -DefaultWorkdir $WorkDir
+Ensure-EnvConfig -EnvPath $envPath -CodexCommand $codexCommand
 
 Write-Step "验证 Python 文件和本地命令"
 $compileCheck = Invoke-PythonCapture -PythonCommand $python -Arguments @("-m", "py_compile", "codex_bridge_client.py", "qq_gateway_client.py", "qq_gateway_background.py") -WorkingDirectory $clientDir

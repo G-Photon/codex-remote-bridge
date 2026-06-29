@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 Set-Location -LiteralPath $PSScriptRoot
 
 $logDir = Join-Path $PSScriptRoot "data"

@@ -156,7 +156,6 @@ Copy-Item .env.example .env
 QQ_APP_ID=replace-with-qq-app-id
 QQ_APP_SECRET=replace-with-qq-app-secret
 CODEX_COMMAND=codex
-CODEX_WORKDIR=C:\path\to\your\workspace
 CODEX_CONTEXT_MODE=native
 CODEX_MODEL=gpt-5.5
 CODEX_REASONING_EFFORT=xhigh
@@ -467,7 +466,6 @@ Edit `client/.env`:
 QQ_APP_ID=replace-with-qq-app-id
 QQ_APP_SECRET=replace-with-qq-app-secret
 CODEX_COMMAND=codex
-CODEX_WORKDIR=C:\path\to\your\workspace
 CODEX_CONTEXT_MODE=native
 CODEX_MODEL=gpt-5.5
 CODEX_REASONING_EFFORT=xhigh

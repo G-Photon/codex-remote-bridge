@@ -30,6 +30,7 @@ from codex_bridge_client import (
     handle_bridge_command,
     job_session_key,
     list_native_sessions,
+    local_time_text,
     load_state,
     load_dotenv,
     native_session_groups,
@@ -46,7 +47,8 @@ from codex_bridge_client import (
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 ATTACHMENTS_DIR = DATA_DIR / "attachments"
-load_dotenv(BASE_DIR / ".env")
+ENV_FILE = BASE_DIR / ".env"
+load_dotenv(ENV_FILE)
 
 DEFAULT_INTENTS = (1 << 25) | (1 << 26)
 USER_AGENT = "CodexRemoteBridge/0.2 QQGateway"
@@ -139,6 +141,55 @@ show_task_context_on_final = QQ_SHOW_TASK_CONTEXT_ON_FINAL
 truncate_long_replies = QQ_TRUNCATE_LONG_REPLIES
 task_status_interval_seconds = QQ_TASK_STATUS_INTERVAL_SECONDS
 task_output_settings_lock = threading.Lock()
+allowed_user_env_lock = threading.Lock()
+
+
+def split_env_csv(raw: str) -> List[str]:
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def remember_allowed_user_openid(openid: str) -> None:
+    openid = (openid or "").strip()
+    if not openid:
+        return
+
+    with allowed_user_env_lock:
+        try:
+            text = ENV_FILE.read_text(encoding="utf-8-sig") if ENV_FILE.exists() else ""
+            lines = text.splitlines()
+            trailing_newline = bool(text) and text.endswith(("\n", "\r"))
+            key_prefix = "QQ_ALLOWED_USER_OPENIDS="
+            found = False
+            changed = False
+
+            for index, line in enumerate(lines):
+                if not line.startswith(key_prefix):
+                    continue
+                found = True
+                values = split_env_csv(line[len(key_prefix):])
+                if openid in values:
+                    break
+                values.append(openid)
+                lines[index] = key_prefix + ",".join(values)
+                changed = True
+                break
+
+            if not found:
+                if lines and lines[-1].strip():
+                    lines.append("")
+                lines.append(key_prefix + openid)
+                changed = True
+
+            if not changed:
+                return
+
+            output = "\n".join(lines)
+            if trailing_newline or not output.endswith("\n"):
+                output += "\n"
+            ENV_FILE.write_text(output, encoding="utf-8")
+            print(f"[qq] remembered c2c user {openid[:12]} in .env", flush=True)
+        except Exception as exc:
+            print(f"[qq] failed to remember c2c user {openid[:12]}: {exc}", flush=True)
 
 
 def save_runtime_setting(name: str, value: Any) -> None:
@@ -534,11 +585,7 @@ def shorten_label(text: str, limit: int = 18) -> str:
 
 
 def compact_time(text: Any) -> str:
-    value = str(text or "").strip()
-    match = re.search(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})", value)
-    if match:
-        return f"{match.group(2)}-{match.group(3)} {match.group(4)}:{match.group(5)}"
-    return value[:16]
+    return local_time_text(text, compact=True)
 
 
 def short_id(value: str, size: int = 6) -> str:
@@ -548,6 +595,8 @@ def short_id(value: str, size: int = 6) -> str:
 
 def short_cwd_label(cwd: str) -> str:
     cwd = re.sub(r"\s+", " ", (cwd or "").strip())
+    if cwd == "__codex_conversations__":
+        return "对话"
     if not cwd:
         return "未记录目录"
     path = Path(cwd)
@@ -1130,6 +1179,7 @@ def build_task_queued_card(task_id: str) -> Dict[str, Any]:
                     "buttons": [
                         keyboard_button("查看任务队列", "/tasks", button_id=f"tasks-{short}", style=1),
                         keyboard_button("取消当前任务", f"/cancel {task_id}", button_id=f"cancel-task-{short}", style=0),
+                        keyboard_button("查看最新运行记录", "/recent 10", button_id=f"recent-task-{short}", style=1),
                     ]
                 }
             ]
@@ -1454,6 +1504,7 @@ def extract_job(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if QQ_ALLOWED_USER_OPENIDS and openid not in QQ_ALLOWED_USER_OPENIDS:
             print(f"[qq] blocked c2c user {openid[:12]}", flush=True)
             return None
+        remember_allowed_user_openid(openid)
         return enrich_job({
             "id": job_id,
             "source": "qq-gateway",
@@ -1854,7 +1905,7 @@ def event_debug_summary(event_type: str, data: Any) -> str:
 
 def command_card(text: str) -> Optional[Dict[str, Any]]:
     command, args = split_command(text)
-    if command == "/start":
+    if command in {"/start", "/s"}:
         return build_start_card()
     if command == "/setup":
         return build_setup_card()
@@ -2072,9 +2123,9 @@ def worker_loop(api: QQApi, jobs: "queue.Queue[Dict[str, Any]]", stop_event: thr
             jobs.task_done()
             schedule_restart("worker command")
             continue
-        if command_name == "/start":
+        if command_name in {"/start", "/s"}:
             mark_auto_start_sent(str(job.get("from", "")))
-        if command_name != "/start" and mark_auto_start_sent(str(job.get("from", ""))):
+        if command_name not in {"/start", "/s"} and mark_auto_start_sent(str(job.get("from", ""))):
             seq = send_command_reply(api, job["reply"], "/start", seq)
             print(f"[qq-send-auto-start] event={job['event_type']} from={job['from']}", flush=True)
 
