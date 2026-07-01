@@ -30,6 +30,7 @@ from codex_bridge_client import (
     handle_bridge_command,
     job_session_key,
     list_native_sessions,
+    local_time_text,
     load_state,
     load_dotenv,
     native_session_groups,
@@ -46,7 +47,9 @@ from codex_bridge_client import (
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 ATTACHMENTS_DIR = DATA_DIR / "attachments"
-load_dotenv(BASE_DIR / ".env")
+ENV_FILE = BASE_DIR / ".env"
+GATEWAY_STATUS_FILE = DATA_DIR / "qq-gateway-status.json"
+load_dotenv(ENV_FILE)
 
 DEFAULT_INTENTS = (1 << 25) | (1 << 26)
 USER_AGENT = "CodexRemoteBridge/0.2 QQGateway"
@@ -110,6 +113,9 @@ QQ_SEND_PARTIAL_OUTPUTS = env_bool("QQ_SEND_PARTIAL_OUTPUTS", False)
 QQ_SHOW_TASK_CONTEXT_ON_FINAL = env_bool("QQ_SHOW_TASK_CONTEXT_ON_FINAL", True)
 QQ_TRUNCATE_LONG_REPLIES = env_bool("QQ_TRUNCATE_LONG_REPLIES", True)
 QQ_RECONNECT_SECONDS = env_int("QQ_RECONNECT_SECONDS", 5)
+QQ_HEALTH_CHECK_INTERVAL_SECONDS = max(10, env_int("QQ_HEALTH_CHECK_INTERVAL_SECONDS", 60))
+QQ_READY_TIMEOUT_SECONDS = max(5, env_int("QQ_READY_TIMEOUT_SECONDS", 8))
+QQ_GATEWAY_STALE_SECONDS = max(30, env_int("QQ_GATEWAY_STALE_SECONDS", 180))
 QQ_DEDUP_SECONDS = env_int("QQ_DEDUP_SECONDS", 600)
 QQ_SEND_PROCESSING_MESSAGE = env_bool("QQ_SEND_PROCESSING_MESSAGE", False)
 QQ_PROCESSING_TEXT = os.getenv("QQ_PROCESSING_TEXT", "收到，正在处理。").strip()
@@ -139,6 +145,82 @@ show_task_context_on_final = QQ_SHOW_TASK_CONTEXT_ON_FINAL
 truncate_long_replies = QQ_TRUNCATE_LONG_REPLIES
 task_status_interval_seconds = QQ_TASK_STATUS_INTERVAL_SECONDS
 task_output_settings_lock = threading.Lock()
+allowed_user_env_lock = threading.Lock()
+gateway_status_lock = threading.Lock()
+
+
+def write_gateway_status(status: str, detail: str = "", session_id: str = "", ready: bool = False) -> None:
+    payload = {
+        "status": status,
+        "detail": detail,
+        "session_id": session_id,
+        "ready": ready,
+        "pid": os.getpid(),
+        "updated_at": time.time(),
+        "updated_at_text": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    tmp = GATEWAY_STATUS_FILE.with_name(f"{GATEWAY_STATUS_FILE.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    with gateway_status_lock:
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(GATEWAY_STATUS_FILE)
+        except Exception as exc:
+            print(f"[gateway-status-error] {exc}", flush=True)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+
+
+def split_env_csv(raw: str) -> List[str]:
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def remember_allowed_user_openid(openid: str) -> None:
+    openid = (openid or "").strip()
+    if not openid:
+        return
+
+    with allowed_user_env_lock:
+        try:
+            text = ENV_FILE.read_text(encoding="utf-8-sig") if ENV_FILE.exists() else ""
+            lines = text.splitlines()
+            trailing_newline = bool(text) and text.endswith(("\n", "\r"))
+            key_prefix = "QQ_ALLOWED_USER_OPENIDS="
+            found = False
+            changed = False
+
+            for index, line in enumerate(lines):
+                if not line.startswith(key_prefix):
+                    continue
+                found = True
+                values = split_env_csv(line[len(key_prefix):])
+                if openid in values:
+                    break
+                values.append(openid)
+                lines[index] = key_prefix + ",".join(values)
+                changed = True
+                break
+
+            if not found:
+                if lines and lines[-1].strip():
+                    lines.append("")
+                lines.append(key_prefix + openid)
+                changed = True
+
+            if not changed:
+                return
+
+            output = "\n".join(lines)
+            if trailing_newline or not output.endswith("\n"):
+                output += "\n"
+            ENV_FILE.write_text(output, encoding="utf-8")
+            print(f"[qq] remembered c2c user {openid[:12]} in .env", flush=True)
+        except Exception as exc:
+            print(f"[qq] failed to remember c2c user {openid[:12]}: {exc}", flush=True)
 
 
 def save_runtime_setting(name: str, value: Any) -> None:
@@ -205,6 +287,32 @@ def split_command(text: str) -> tuple[str, str]:
         return "", ""
     command, _, args = text.partition(" ")
     return command.lower().strip(), args.strip()
+
+
+def codex_instruction_payload(text: str) -> Optional[str]:
+    command, args = split_command(text)
+    if command not in {"/ci", "/codexinstruction"}:
+        return None
+    return args.strip()
+
+
+def apply_codex_instruction(job: Dict[str, Any]) -> Optional[str]:
+    payload = codex_instruction_payload(str(job.get("text", "")))
+    if payload is None:
+        return None
+    if not payload:
+        return "\n".join([
+            "Codex 指令转发",
+            "用法：",
+            "/ci <要发送给 Codex 的内容>",
+            "/codexInstruction <要发送给 Codex 的内容>",
+            "",
+            "示例：",
+            "/ci /wiki init agent-memory --title \"Agent Memory\"",
+        ])
+    job["text"] = payload
+    job["force_codex_instruction"] = True
+    return None
 
 
 def is_allowed_interaction_user(data: Dict[str, Any]) -> bool:
@@ -534,11 +642,7 @@ def shorten_label(text: str, limit: int = 18) -> str:
 
 
 def compact_time(text: Any) -> str:
-    value = str(text or "").strip()
-    match = re.search(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})", value)
-    if match:
-        return f"{match.group(2)}-{match.group(3)} {match.group(4)}:{match.group(5)}"
-    return value[:16]
+    return local_time_text(text, compact=True)
 
 
 def short_id(value: str, size: int = 6) -> str:
@@ -548,6 +652,8 @@ def short_id(value: str, size: int = 6) -> str:
 
 def short_cwd_label(cwd: str) -> str:
     cwd = re.sub(r"\s+", " ", (cwd or "").strip())
+    if cwd == "__codex_conversations__":
+        return "对话"
     if not cwd:
         return "未记录目录"
     path = Path(cwd)
@@ -1130,6 +1236,7 @@ def build_task_queued_card(task_id: str) -> Dict[str, Any]:
                     "buttons": [
                         keyboard_button("查看任务队列", "/tasks", button_id=f"tasks-{short}", style=1),
                         keyboard_button("取消当前任务", f"/cancel {task_id}", button_id=f"cancel-task-{short}", style=0),
+                        keyboard_button("查看最新运行记录", "/recent 10", button_id=f"recent-task-{short}", style=1),
                     ]
                 }
             ]
@@ -1454,6 +1561,7 @@ def extract_job(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if QQ_ALLOWED_USER_OPENIDS and openid not in QQ_ALLOWED_USER_OPENIDS:
             print(f"[qq] blocked c2c user {openid[:12]}", flush=True)
             return None
+        remember_allowed_user_openid(openid)
         return enrich_job({
             "id": job_id,
             "source": "qq-gateway",
@@ -1854,7 +1962,7 @@ def event_debug_summary(event_type: str, data: Any) -> str:
 
 def command_card(text: str) -> Optional[Dict[str, Any]]:
     command, args = split_command(text)
-    if command == "/start":
+    if command in {"/start", "/s"}:
         return build_start_card()
     if command == "/setup":
         return build_setup_card()
@@ -2063,6 +2171,15 @@ def worker_loop(api: QQApi, jobs: "queue.Queue[Dict[str, Any]]", stop_event: thr
             flush=True,
         )
         seq = 1
+        ci_reply = apply_codex_instruction(job)
+        if ci_reply is not None:
+            try:
+                api.send_message(job["reply"], ci_reply, seq)
+            except Exception as exc:
+                print(f"[qq-send-ci-help-error] {exc}", flush=True)
+            jobs.task_done()
+            continue
+
         command_name, _ = split_command(job["text"])
         if command_name == "/restart":
             try:
@@ -2072,9 +2189,9 @@ def worker_loop(api: QQApi, jobs: "queue.Queue[Dict[str, Any]]", stop_event: thr
             jobs.task_done()
             schedule_restart("worker command")
             continue
-        if command_name == "/start":
+        if command_name in {"/start", "/s"}:
             mark_auto_start_sent(str(job.get("from", "")))
-        if command_name != "/start" and mark_auto_start_sent(str(job.get("from", ""))):
+        if command_name not in {"/start", "/s"} and mark_auto_start_sent(str(job.get("from", ""))):
             seq = send_command_reply(api, job["reply"], "/start", seq)
             print(f"[qq-send-auto-start] event={job['event_type']} from={job['from']}", flush=True)
 
@@ -2091,9 +2208,11 @@ def worker_loop(api: QQApi, jobs: "queue.Queue[Dict[str, Any]]", stop_event: thr
             except Exception as exc:
                 print(f"[qq-send-command-processing-error] {exc}", flush=True)
 
-        command_reply = local_gateway_command_reply(job["text"])
-        if command_reply is None:
-            command_reply = handle_bridge_command(job["text"], job)
+        command_reply = None
+        if not job.get("force_codex_instruction"):
+            command_reply = local_gateway_command_reply(job["text"])
+            if command_reply is None:
+                command_reply = handle_bridge_command(job["text"], job)
         if command_reply is not None:
             card = command_card(job["text"])
             if card is not None:
@@ -2138,7 +2257,15 @@ def worker_loop(api: QQApi, jobs: "queue.Queue[Dict[str, Any]]", stop_event: thr
 
 
 class QQGatewayClient:
-    def __init__(self, api: QQApi, jobs: "queue.Queue[Dict[str, Any]]") -> None:
+    def __init__(
+        self,
+        api: QQApi,
+        jobs: "queue.Queue[Dict[str, Any]]",
+        ready_event: Optional[threading.Event] = None,
+        stop_on_ready: bool = False,
+        send_startup_on_ready: bool = False,
+        update_status: bool = True,
+    ) -> None:
         self.api = api
         self.jobs = jobs
         self.dedup = TTLSet(QQ_DEDUP_SECONDS)
@@ -2146,7 +2273,22 @@ class QQGatewayClient:
         self.latest_seq: Optional[int] = None
         self.session_id = ""
         self.heartbeat_stop: Optional[threading.Event] = None
+        self.health_stop: Optional[threading.Event] = None
         self.lock = threading.Lock()
+        self.ready_event = ready_event
+        self.stop_on_ready = stop_on_ready
+        self.send_startup_on_ready = send_startup_on_ready
+        self.update_status = update_status
+        self.startup_sent = False
+        self.last_error = ""
+        self.ready = False
+        self.connection_started_at = 0.0
+        self.last_gateway_message_at = 0.0
+        self.last_heartbeat_ack_at = 0.0
+
+    def write_status(self, status: str, detail: str = "", session_id: str = "", ready: bool = False) -> None:
+        if self.update_status:
+            write_gateway_status(status, detail, session_id, ready)
 
     def connect_once(self) -> None:
         if websocket is None:
@@ -2154,6 +2296,12 @@ class QQGatewayClient:
 
         gateway_url = self.api.gateway_url()
         print(f"[gateway] connecting {gateway_url}", flush=True)
+        self.write_status("connecting", "connecting to QQ Gateway", ready=False)
+        now = time.time()
+        self.ready = False
+        self.connection_started_at = now
+        self.last_gateway_message_at = now
+        self.last_heartbeat_ack_at = now
 
         self.ws = websocket.WebSocketApp(
             gateway_url,
@@ -2161,6 +2309,7 @@ class QQGatewayClient:
             on_error=self.on_error,
             on_close=self.on_close,
         )
+        self.start_health_monitor()
         self.ws.run_forever(ping_interval=0)
 
     def send_gateway(self, payload: Dict[str, Any]) -> None:
@@ -2216,10 +2365,45 @@ class QQGatewayClient:
 
         threading.Thread(target=loop, name="qq-heartbeat", daemon=True).start()
 
+    def start_health_monitor(self) -> None:
+        if self.health_stop:
+            self.health_stop.set()
+        stop_event = threading.Event()
+        self.health_stop = stop_event
+        check_interval = max(1.0, min(
+            float(QQ_HEALTH_CHECK_INTERVAL_SECONDS),
+            float(QQ_READY_TIMEOUT_SECONDS),
+            float(QQ_GATEWAY_STALE_SECONDS),
+        ))
+
+        def loop() -> None:
+            while not stop_event.wait(check_interval):
+                now = time.time()
+                if not self.ready and self.connection_started_at and now - self.connection_started_at > QQ_READY_TIMEOUT_SECONDS:
+                    print(
+                        f"[gateway-health] READY timeout after {int(now - self.connection_started_at)}s; reconnecting",
+                        flush=True,
+                    )
+                    self.close()
+                    return
+                if self.ready and self.last_heartbeat_ack_at and now - self.last_heartbeat_ack_at > QQ_GATEWAY_STALE_SECONDS:
+                    print(
+                        f"[gateway-health] heartbeat stale for {int(now - self.last_heartbeat_ack_at)}s; reconnecting",
+                        flush=True,
+                    )
+                    self.close()
+                    return
+        threading.Thread(target=loop, name="qq-health-monitor", daemon=True).start()
+
     def stop_heartbeat(self) -> None:
         if self.heartbeat_stop:
             self.heartbeat_stop.set()
             self.heartbeat_stop = None
+
+    def stop_health_monitor(self) -> None:
+        if self.health_stop:
+            self.health_stop.set()
+            self.health_stop = None
 
     def on_message(self, _ws, message: str) -> None:
         try:
@@ -2229,6 +2413,7 @@ class QQGatewayClient:
             return
 
         try:
+            self.last_gateway_message_at = time.time()
             if payload.get("s") is not None:
                 self.latest_seq = payload.get("s")
 
@@ -2236,20 +2421,26 @@ class QQGatewayClient:
             if op == 10:
                 interval_ms = int((payload.get("d") or {}).get("heartbeat_interval", 45000))
                 print(f"[gateway] hello heartbeat_interval={interval_ms}ms", flush=True)
+                self.write_status("hello", f"heartbeat_interval={interval_ms}ms", self.session_id, ready=False)
                 self.start_heartbeat(interval_ms)
                 self.identify_or_resume()
                 return
 
             if op == 11:
+                self.last_heartbeat_ack_at = time.time()
+                if self.ready:
+                    self.write_status("online", "heartbeat ack", self.session_id, ready=True)
                 return
 
             if op == 7:
                 print("[gateway] server requested reconnect", flush=True)
+                self.write_status("reconnecting", "server requested reconnect", self.session_id, ready=False)
                 self.close()
                 return
 
             if op == 9:
                 print("[gateway] invalid session; reconnecting with identify", flush=True)
+                self.write_status("reconnecting", "invalid session", "", ready=False)
                 self.session_id = ""
                 self.latest_seq = None
                 self.close()
@@ -2267,12 +2458,32 @@ class QQGatewayClient:
             if event_type == "READY":
                 data = payload.get("d") or {}
                 self.session_id = str(data.get("session_id", ""))
+                self.ready = True
+                self.last_heartbeat_ack_at = time.time()
                 user = data.get("user") or {}
                 print(f"[gateway] READY bot={user.get('username', '')} session={self.session_id[:8]}", flush=True)
+                self.write_status("online", f"READY bot={user.get('username', '')}", self.session_id, ready=True)
+                if self.ready_event:
+                    self.ready_event.set()
+                if self.send_startup_on_ready and not self.startup_sent:
+                    self.startup_sent = True
+                    send_startup_start_messages(self.api)
+                if self.stop_on_ready:
+                    self.close()
                 return
 
             if event_type == "RESUMED":
+                self.ready = True
+                self.last_heartbeat_ack_at = time.time()
                 print("[gateway] RESUMED", flush=True)
+                self.write_status("online", "RESUMED", self.session_id, ready=True)
+                if self.ready_event:
+                    self.ready_event.set()
+                if self.send_startup_on_ready and not self.startup_sent:
+                    self.startup_sent = True
+                    send_startup_start_messages(self.api)
+                if self.stop_on_ready:
+                    self.close()
                 return
 
             if event_type == "INTERACTION_CREATE":
@@ -2324,6 +2535,15 @@ class QQGatewayClient:
                 schedule_restart("gateway command")
                 return
 
+            ci_reply = apply_codex_instruction(job)
+            if ci_reply is not None:
+                print(f"[gateway] codex instruction help from={job['from']}", flush=True)
+                try:
+                    self.api.send_message(job["reply"], ci_reply, 1)
+                except Exception as exc:
+                    print(f"[qq-send-ci-help-error] {exc}", flush=True)
+                return
+
             try:
                 self.jobs.put_nowait(job)
                 print(f"[gateway] queued {job['event_type']} id={job['id']}", flush=True)
@@ -2338,14 +2558,21 @@ class QQGatewayClient:
             print(traceback.format_exc(), flush=True)
 
     def on_error(self, _ws, error) -> None:
+        self.last_error = str(error)
+        self.write_status("error", self.last_error, self.session_id, ready=False)
         print(f"[gateway-error] {error}", flush=True)
 
     def on_close(self, _ws, code, reason) -> None:
         self.stop_heartbeat()
+        self.stop_health_monitor()
+        self.ready = False
+        self.write_status("closed", f"code={code} reason={reason}", self.session_id, ready=False)
         print(f"[gateway] closed code={code} reason={reason}", flush=True)
 
     def close(self) -> None:
         self.stop_heartbeat()
+        self.stop_health_monitor()
+        self.ready = False
         with self.lock:
             if self.ws:
                 self.ws.close()
@@ -2360,7 +2587,84 @@ def validate_config() -> None:
         raise RuntimeError("QQ_REPLY_MAX_CHARS is too small")
 
 
+def check_qq_http_config() -> int:
+    try:
+        validate_config()
+        api = QQApi()
+        token = api.access_token()
+        print(f"[health] access_token ok length={len(token)}", flush=True)
+        gateway_url = api.gateway_url()
+        print(f"[health] gateway url ok {gateway_url}", flush=True)
+        return 0
+    except Exception as exc:
+        print(f"[health-error] {exc}", file=sys.stderr, flush=True)
+        return 2
+
+
+def check_qq_gateway_ready(timeout_seconds: float = 30.0) -> int:
+    try:
+        validate_config()
+    except Exception as exc:
+        print(f"[health-error] {exc}", file=sys.stderr, flush=True)
+        return 2
+
+    if websocket is None:
+        print("[health-error] install websocket-client first: pip install websocket-client", file=sys.stderr, flush=True)
+        return 2
+
+    websocket.enableTrace(env_bool("QQ_WEBSOCKET_TRACE", False))
+    api = QQApi()
+    try:
+        token = api.access_token()
+        print(f"[health] access_token ok length={len(token)}", flush=True)
+    except Exception as exc:
+        print(f"[health-error] QQ token check failed: {exc}", file=sys.stderr, flush=True)
+        return 2
+
+    ready_event = threading.Event()
+    jobs: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=1)
+    client = QQGatewayClient(api, jobs, ready_event=ready_event, stop_on_ready=True, update_status=False)
+    errors: List[str] = []
+
+    def connect_for_health() -> None:
+        try:
+            client.connect_once()
+        except Exception as exc:
+            client.last_error = str(exc)
+            errors.append(str(exc))
+
+    thread = threading.Thread(target=connect_for_health, name="qq-health-check", daemon=True)
+    thread.start()
+    deadline = time.time() + max(3.0, timeout_seconds)
+    while time.time() < deadline:
+        if ready_event.wait(0.2):
+            client.close()
+            thread.join(timeout=3)
+            print("[health] gateway READY ok", flush=True)
+            return 0
+        if not thread.is_alive():
+            break
+
+    client.close()
+    thread.join(timeout=3)
+    detail = client.last_error or "; ".join(errors) or "READY timeout"
+    print(f"[health-error] gateway READY check failed: {detail}", file=sys.stderr, flush=True)
+    return 3
+
+
 def main() -> int:
+    if "--check-qq-http" in sys.argv:
+        return check_qq_http_config()
+    if "--check-qq-ready" in sys.argv:
+        timeout = 30.0
+        for index, arg in enumerate(sys.argv):
+            if arg == "--timeout" and index + 1 < len(sys.argv):
+                try:
+                    timeout = float(sys.argv[index + 1])
+                except ValueError:
+                    pass
+        return check_qq_gateway_ready(timeout)
+
     try:
         validate_config()
     except Exception as exc:
@@ -2369,6 +2673,7 @@ def main() -> int:
 
     if websocket is None:
         print("config error: install websocket-client first: pip install websocket-client", file=sys.stderr)
+        write_gateway_status("config_error", "install websocket-client first", ready=False)
         return 2
 
     websocket.enableTrace(env_bool("QQ_WEBSOCKET_TRACE", False))
@@ -2377,13 +2682,14 @@ def main() -> int:
     stop_event = threading.Event()
     threading.Thread(target=worker_loop, args=(api, jobs, stop_event), name="codex-worker", daemon=True).start()
     client = QQGatewayClient(api, jobs)
+    client.send_startup_on_ready = True
 
     print(
         f"qq gateway bridge starting app_id={QQ_APP_ID} intents={QQ_GATEWAY_INTENTS} "
         f"events={','.join(sorted(QQ_ALLOWED_EVENTS))}",
         flush=True,
     )
-    send_startup_start_messages(api)
+    write_gateway_status("starting", "qq gateway bridge starting", ready=False)
 
     try:
         while True:

@@ -1,11 +1,11 @@
-param(
+﻿param(
     [string]$OutputPath = ""
 )
 
 $ErrorActionPreference = "Stop"
 
-$clientDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$rootDir = Split-Path -Parent $clientDir
+$rootDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$clientDir = Join-Path $rootDir "client"
 $sourcePath = Join-Path $clientDir "tray\CodexRemoteBridgeTray.cs"
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
     $OutputPath = Join-Path $rootDir "CodexRemoteBridgeTray.exe"
