@@ -15,6 +15,42 @@ MAX_LOG_BYTES = 5 * 1024 * 1024
 RESTART_DELAY_SECONDS = 10
 
 
+def merged_windows_path() -> str:
+    if os.name != "nt":
+        return os.environ.get("PATH", "")
+    try:
+        import winreg
+
+        parts = []
+        for root, subkey in (
+            (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+            (winreg.HKEY_CURRENT_USER, r"Environment"),
+        ):
+            try:
+                with winreg.OpenKey(root, subkey) as key:
+                    value, _ = winreg.QueryValueEx(key, "Path")
+                    expanded = os.path.expandvars(str(value))
+                    if expanded:
+                        parts.extend(expanded.split(os.pathsep))
+            except OSError:
+                pass
+        parts.extend(os.environ.get("PATH", "").split(os.pathsep))
+        seen = set()
+        merged = []
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            key = part.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(part)
+        return os.pathsep.join(merged)
+    except Exception:
+        return os.environ.get("PATH", "")
+
+
 def now_text() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -47,6 +83,7 @@ def main() -> int:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
+    env["PATH"] = merged_windows_path()
 
     creationflags = 0
     if os.name == "nt":
